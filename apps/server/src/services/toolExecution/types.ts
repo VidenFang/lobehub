@@ -28,6 +28,13 @@ export interface ServerSubAgentRunParams {
 
 export interface ServerSubAgentRunResult {
   /**
+   * Reason the child failed to start, when `started` is false. Surfaced to the
+   * parent agent's tool result so a `callAgent` dispatch failure is diagnosable
+   * (e.g. "Agent not found", config/scheduling error) instead of an opaque
+   * "failed to start" — see issue #16257.
+   */
+  error?: string;
+  /**
    * Whether the child op was actually forked. `false` means the child failed to
    * start (e.g. the operation row could not be created/scheduled): no completion
    * bridge will ever fire, so the caller must surface an inline tool error
@@ -119,6 +126,15 @@ export interface ToolExecutionContext {
    * result; the member barrier backfills + resumes/finishes the parked supervisor.
    */
   agentMember?: ServerAgentMemberRunner;
+  /**
+   * Visibility of the agent executing this tool call. Resolved once per tool
+   * call in the runtime executor. Tool runtimes that persist agent side-effects
+   * (documents, tasks, etc.) forward this so private-agent output inherits
+   * private visibility and public-agent reads are gated away from private data
+   * — mirroring the `assertAgentVisibilityCompat` invariant on tasks.
+   * `null` when the agent is missing or not visible to the caller.
+   */
+  agentVisibility?: 'private' | 'public' | null;
   /**
    * The assistant message that carries this tool call (the runtime's
    * `payload.parentMessageId`). Distinct from `messageId`, which is the source

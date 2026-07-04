@@ -42,7 +42,7 @@ import {
   HistorySummaryProvider,
   KnowledgeInjector,
   LocalSystemToolSnapshotInjector,
-  ModelKnowledgeCutoffProvider,
+  ModelInfoProvider,
   OnboardingActionHintInjector,
   OnboardingContextInjector,
   OnboardingSyntheticStateInjector,
@@ -138,6 +138,7 @@ export class MessagesEngine {
   private buildProcessors(): ContextProcessor[] {
     const {
       model,
+      modelDisplayName,
       modelKnowledgeCutoff,
       provider,
       systemRole,
@@ -247,8 +248,12 @@ export class MessagesEngine {
       }),
       // System date
       new SystemDateProvider({ enabled: isSystemDateEnabled, timezone }),
-      // Model knowledge cutoff
-      new ModelKnowledgeCutoffProvider({ knowledgeCutoff: modelKnowledgeCutoff }),
+      // Model info (name / id / knowledge cutoff)
+      new ModelInfoProvider({
+        displayName: modelDisplayName,
+        knowledgeCutoff: modelKnowledgeCutoff,
+        modelId: model,
+      }),
       // Skill context (available skills list + activated skill content).
       // Disabled in chat mode — pairs with the tools-engine gate so the LLM
       // sees neither the manifests nor the discovery prompt.
@@ -413,7 +418,7 @@ export class MessagesEngine {
       // auto-repair failure feedback as a user turn for the repair run
       new VerifyMessageProcessor(),
       // Task-callback cards: surface a finished task's handoff as a user turn
-      // so the creator agent reads it and continues (LOBE-10625)
+      // so the creator agent reads it and continues
       new TaskCallbackMessageProcessor(),
       // Supervisor role restore
       new SupervisorRoleRestoreProcessor(),

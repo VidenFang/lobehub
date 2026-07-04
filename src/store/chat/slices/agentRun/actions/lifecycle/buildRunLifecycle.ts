@@ -2,18 +2,14 @@ import type { AgentState } from '@lobechat/agent-runtime';
 import { isDesktop } from '@lobechat/const';
 import type { ConversationContext, UIChatMessage } from '@lobechat/types';
 import debug from 'debug';
-import { t } from 'i18next';
 
-import { getAgentStoreState } from '@/store/agent';
-import { agentSelectors } from '@/store/agent/selectors';
 import type { AgentRuntimeType } from '@/store/chat/slices/agentRun/actions/dispatch/agentDispatcher';
 import { emitClientAgentSignalSourceEvent } from '@/store/chat/slices/agentRun/actions/lifecycle/agentSignalBridge';
 import type { ChatStore } from '@/store/chat/store';
-import { resolveNotificationNavigatePath } from '@/store/chat/utils/desktopNotification';
+import { notifyDesktopAgentCompleted } from '@/store/chat/utils/desktopNotification';
 import { markdownToTxt } from '@/utils/markdownToTxt';
 
 import { messageMapKey } from '../../../../utils/messageMapKey';
-import { topicMapKey } from '../../../../utils/topicMapKey';
 import { displayMessageSelectors } from '../../../message/selectors/displayMessage';
 import type { OperationStatus } from '../../../operation/types';
 import { mergeQueuedMessages, reconstructUploadFilesFromQueue } from '../../../operation/types';
@@ -199,9 +195,10 @@ export const buildRunLifecycle = (
         }
         const firstUserText = messages.find((m) => m.role === 'user')?.content?.trim() ?? '';
         const title = markdownToTxt(firstUserText).slice(0, 80) || 'New Topic';
+        // `internal_updateTopic` already balances its own loading owner. For a
+        // new client-runtime topic like "阅读下面...", an extra `false` here would
+        // consume the runtime's loading owner and hide the sidebar spinner early.
         await get().internal_updateTopic(tid, { title });
-        // summaryTopicTitle would normally clear loading via onLoadingChange; do it manually.
-        get().internal_updateTopicLoading(tid, false);
         console.info('[dev] sliced topic title (NEXT_PUBLIC_DEV_DISABLE_AUTO_TOPIC=1):', title);
       };
 
@@ -234,76 +231,62 @@ export const buildRunLifecycle = (
       }
     },
     afterRunComplete: async (event: RunCompleteEvent) => {
-      // Desktop notification + dock badge. Single home for all three runtimes'
-      // completion notification — unified in afterRunComplete so every transport
-      // fires the same notification/badge logic exactly once.
+      // Desktop notification + dock badge. Single home for all runtimes'
+      // completion notification — every transport funnels through the shared
+      // `notifyDesktopAgentCompleted` helper, so title (topic/agent name), body
+      // (the actual reply) and click-to-deep-link stay identical across them.
       // Top-level-only: a nested sub-agent finishing is not a user-facing run
       // completion — the parent run is still going, so it must not fire a
       // "generation finished" notification / badge. See RunScope.
       if (adapter.runScope === 'sub_agent') return;
       if (!isDesktop) return;
-      try {
-        const { desktopNotificationService } =
-          await import('@/services/electron/desktopNotification');
-        const navigatePath = resolveNotificationNavigatePath({ agentId, groupId, topicId });
-        const navigate = navigatePath ? { path: navigatePath } : undefined;
 
-        if (adapter.runtimeType === 'client') {
-          // CLIENT: notify only OUTSIDE tool-calling mode; title + body derived
-          // from the in-memory store. Relocated verbatim — no badge (preserves
-          // the prior client behavior).
-          const finalMessages = get().messagesMap[messageKey] || [];
-          const lastAssistant = finalMessages.findLast((m) => m.role === 'assistant');
-          if (!lastAssistant?.content || lastAssistant?.tools) return;
+      const notificationContext = { agentId, groupId, topicId };
 
-          let notificationTitle = t('notification.finishChatGeneration', { ns: 'electron' });
-          if (topicId) {
-            const key = topicMapKey({ agentId, groupId });
-            const topicData = get().topicDataMap[key];
-            const topic = topicData?.items?.find((item) => item.id === topicId);
-            if (topic?.title) notificationTitle = topic.title;
-          } else {
-            const agentMeta = agentSelectors.getAgentMetaById(agentId)(getAgentStoreState());
-            if (agentMeta?.title) notificationTitle = agentMeta.title;
-          }
+      if (adapter.runtimeType === 'client') {
+        // CLIENT: notify only OUTSIDE tool-calling mode; content comes from the
+        // in-memory store. No badge (preserves the prior client behavior).
+        //
+        // Anchor to the assistant message THIS run produced (walk from
+        // parentMessageId), NOT a positional findLast on the topic. On a later
+        // turn the fresh assistant can still be settling into messagesMap while
+        // the previous turn's assistant is the last populated one — a naive
+        // findLast then surfaces the PRIOR turn's reply as the notification body.
+        // Mirror emitComplete's dual-map (messagesMap → dbMessagesMap) lookup so
+        // the body is pinned to this run's freshest persisted content.
+        const finalMessages = get().messagesMap[messageKey] || [];
+        const dbMessages = get().dbMessagesMap[messageKey] || [];
+        const assistantId =
+          findCompletionAssistantMessageId(finalMessages, parentMessageId, parentMessageType) ??
+          findCompletionAssistantMessageId(dbMessages, parentMessageId, parentMessageType);
+        const lastAssistant = assistantId
+          ? (finalMessages.find((m) => m.id === assistantId) ??
+            dbMessages.find((m) => m.id === assistantId))
+          : undefined;
+        if (!lastAssistant?.content || lastAssistant?.tools) return;
 
-          await desktopNotificationService.showNotification({
-            body: markdownToTxt(lastAssistant.content),
-            navigate,
-            title: notificationTitle,
-          });
-          return;
-        }
-
-        // GATEWAY / HETERO: the run-complete title is the generic completion
-        // string; the body is executor-resolved (hetero's `accContent`) when
-        // supplied, else derived from the store's final assistant content
-        // (gateway, after its terminal DB reconciliation). Dock badge is set so a
-        // backgrounded app still signals completion. Mirrors the prior
-        // `notifyCompletion` fan-out.
-        const fallbackContent = (
-          get().messagesMap?.[messageKey] ||
-          get().dbMessagesMap?.[messageKey] ||
-          []
-        ).findLast((m) => m.role === 'assistant')?.content;
-        const body =
-          event.notification?.body ??
-          (fallbackContent
-            ? markdownToTxt(fallbackContent)
-            : t('notification.finishChatGeneration', { ns: 'electron' }));
-        await Promise.allSettled([
-          desktopNotificationService.showNotification({
-            body,
-            navigate,
-            title:
-              event.notification?.title ??
-              t('notification.finishChatGeneration', { ns: 'electron' }),
-          }),
-          desktopNotificationService.setBadgeCount?.(1),
-        ]);
-      } catch (error) {
-        console.error('Desktop notification error:', error);
+        await notifyDesktopAgentCompleted(get, {
+          content: lastAssistant.content,
+          context: notificationContext,
+        });
+        return;
       }
+
+      // GATEWAY / HETERO: the body content is executor-resolved (hetero's
+      // in-memory `accContent`) when supplied, else derived from the store's
+      // final assistant content (gateway, after its terminal DB reconciliation).
+      // Dock badge is set so a backgrounded app still signals completion.
+      const fallbackContent = (
+        get().messagesMap?.[messageKey] ||
+        get().dbMessagesMap?.[messageKey] ||
+        []
+      ).findLast((m) => m.role === 'assistant')?.content;
+
+      await notifyDesktopAgentCompleted(get, {
+        badge: true,
+        content: event.notification?.content || fallbackContent,
+        context: notificationContext,
+      });
     },
     beforeRunComplete: NOOP,
     completeRun: async (event: RunCompleteEvent): Promise<RunCompleteResult> => {

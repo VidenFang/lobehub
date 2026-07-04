@@ -18,10 +18,11 @@ import { wsCompatProcedure } from '@/business/server/trpc-middlewares/workspaceA
 import { MessageModel } from '@/database/models/message';
 import { ThreadModel } from '@/database/models/thread';
 import { TopicModel } from '@/database/models/topic';
-import { topics } from '@/database/schemas';
+import { agentOperations, topics } from '@/database/schemas';
 import { heteroAuthedProcedure, router } from '@/libs/trpc/lambda';
 import { serverDatabase } from '@/libs/trpc/lambda/middleware';
 import { signUserJWT } from '@/libs/trpc/utils/internalJwt';
+import { createStreamEventManager } from '@/server/modules/AgentRuntime/factory';
 import { AgentRuntimeService } from '@/server/services/agentRuntime';
 import { AiAgentService } from '@/server/services/aiAgent';
 import { AiChatService } from '@/server/services/aiChat';
@@ -147,6 +148,12 @@ const ExecAgentSchema = z
             workingDirectory: z.string().optional(),
           })
           .optional(),
+        /**
+         * Group orchestration role of the run, stamped onto the assistant
+         * message's `metadata.orchestrationRole` so the supervisor/member
+         * identity survives the gateway step_start snapshot / refetch.
+         */
+        orchestrationRole: z.enum(['supervisor', 'member']).optional(),
         scope: z.string().nullish(),
         sessionId: z.string().optional(),
         taskId: z.string().nullish(),
@@ -184,6 +191,14 @@ const ExecAgentSchema = z
         toolCallId: z.string(),
       })
       .optional(),
+    /**
+     * Tool identifiers the user @-mentioned in this message. Enabled for this
+     * run in addition to the agent's pinned plugins, so a mentioned tool that
+     * isn't pinned to the agent (e.g. a custom MCP connector picked from the @
+     * list) is callable. Scoped to the caller's own installed tools/connectors
+     * by the user-scoped lookups downstream, so it can't enable others' tools.
+     */
+    selectedToolIds: z.array(z.string()).optional(),
     /** The agent slug to run (either agentId or slug is required) */
     slug: z.string().optional(),
     /**
@@ -358,6 +373,7 @@ const AgentStreamEventSchema = z.object({
     'stream_start',
     'stream_chunk',
     'stream_end',
+    'visible_output_end',
     'stream_retry',
     'tool_start',
     'tool_end',
@@ -406,6 +422,38 @@ const HeteroFinishSchema = z.object({
   result: z.enum(['success', 'error', 'cancelled']),
   sessionId: z.string().optional(),
   topicId: z.string().min(1),
+});
+
+/**
+ * Schema for `aiAgent.waitInterventionResponse` — the exec-side long-poll. The
+ * `lh hetero exec` producer calls this in a loop while an `AskUserBridge`
+ * pending is in flight, draining `agent_intervention_response` events off the
+ * op's Redis stream (which the sandbox can't read directly). `lastEventId`
+ * threads the cursor forward across polls; `'$'` on the first call means
+ * "only events published from now on".
+ */
+const WaitInterventionResponseSchema = z.object({
+  blockMs: z.number().int().positive().max(30_000).default(25_000),
+  lastEventId: z.string().default('$'),
+  operationId: z.string().min(1),
+});
+
+/**
+ * Schema for `aiAgent.submitHeteroIntervention` — the browser leg of remote
+ * Human-in-the-loop. The user's answer to an `agent_intervention_request` is
+ * published back onto the op's Redis stream as an `agent_intervention_response`,
+ * where both the renderer (card → resolved) and the exec long-poll converge on
+ * it by `toolCallId`. Mutually exclusive: `result` on submit, `cancelled` on
+ * skip/cancel.
+ */
+const SubmitHeteroInterventionSchema = z.object({
+  cancelReason: z.enum(['timeout', 'user_cancelled', 'session_ended']).optional(),
+  cancelled: z.boolean().optional(),
+  operationId: z.string().min(1),
+  result: z.unknown().optional(),
+  /** Producer step index; harmless placeholder — correlation is by toolCallId. */
+  stepIndex: z.number().int().nonnegative().default(0),
+  toolCallId: z.string().min(1),
 });
 
 const aiAgentProcedure = wsCompatProcedure.use(serverDatabase).use(async (opts) => {
@@ -640,6 +688,7 @@ export const aiAgentRouter = router({
       fileIds,
       parentMessageId,
       resumeApproval,
+      selectedToolIds,
       trigger,
       userInterventionConfig,
     } = input;
@@ -660,6 +709,7 @@ export const aiAgentRouter = router({
         // human-approval resume — either way, skip user message creation.
         resume: !!parentMessageId,
         resumeApproval,
+        selectedToolIds,
         slug,
         trigger: trigger ?? RequestTrigger.Chat,
         userInterventionConfig,
@@ -1207,6 +1257,19 @@ export const aiAgentRouter = router({
         .from(topics)
         .where(and(eq(topics.id, topicId), eq(topics.userId, ctx.userId)))
         .limit(1);
+
+      // Owner-token callers (a logged-in desktop reusing its own session) must
+      // prove they own the target topic — `topicRow` is already filtered by
+      // `userId`, so a missing row means the topic isn't theirs. The
+      // operation-token path is exempt: its `sub` may be a workspaceId that
+      // never matches `topics.userId`, and it's trusted as server-minted.
+      if (ctx.heteroAuthKind === 'user' && !topicRow) {
+        throw new TRPCError({
+          code: 'FORBIDDEN',
+          message: 'Topic not found or not owned by the caller',
+        });
+      }
+
       const wsId = topicRow?.workspaceId ?? undefined;
       const heteroService = new HeterogeneousAgentService(ctx.serverDB, ctx.userId, {
         workspaceId: wsId,
@@ -1224,6 +1287,9 @@ export const aiAgentRouter = router({
       });
       return { ack: true as const };
     } catch (error: any) {
+      // Preserve deliberate auth errors (e.g. the ownership FORBIDDEN) instead
+      // of masking them as a generic 500.
+      if (error instanceof TRPCError) throw error;
       log('heteroIngest failed: %s', error?.message);
       throw new TRPCError({
         cause: error,
@@ -1252,6 +1318,15 @@ export const aiAgentRouter = router({
         .from(topics)
         .where(and(eq(topics.id, topicId), eq(topics.userId, ctx.userId)))
         .limit(1);
+
+      // See heteroIngest: owner tokens must own the topic; operation tokens are exempt.
+      if (ctx.heteroAuthKind === 'user' && !topicRow) {
+        throw new TRPCError({
+          code: 'FORBIDDEN',
+          message: 'Topic not found or not owned by the caller',
+        });
+      }
+
       const wsId = topicRow?.workspaceId ?? undefined;
       const heteroService = new HeterogeneousAgentService(ctx.serverDB, ctx.userId, {
         workspaceId: wsId,
@@ -1273,6 +1348,9 @@ export const aiAgentRouter = router({
 
       return { ack: true as const };
     } catch (err: any) {
+      // Preserve deliberate auth errors (e.g. the ownership FORBIDDEN) instead
+      // of masking them as a generic 500.
+      if (err instanceof TRPCError) throw err;
       log('heteroFinish failed: %s', err?.message);
       throw new TRPCError({
         cause: err,
@@ -1281,6 +1359,94 @@ export const aiAgentRouter = router({
       });
     }
   }),
+
+  /**
+   * Exec-side long-poll for remote Human-in-the-loop (op-JWT auth, same as
+   * `heteroIngest`). The `lh hetero exec` producer — which holds only an
+   * op-scoped JWT + tRPC and never the server's Redis — pulls
+   * `agent_intervention_response` events off the op's Redis stream through this
+   * server-mediated read, then resolves its in-process `AskUserBridge`. One
+   * bounded `XREAD BLOCK` per call; the producer loops while a pending is in
+   * flight, threading `lastEventId` forward so nothing is missed between polls.
+   */
+  waitInterventionResponse: heteroAgentProcedure
+    .input(WaitInterventionResponseSchema)
+    .query(async ({ input, ctx }) => {
+      const { operationId, lastEventId, blockMs } = input;
+
+      // Ownership guard, mirroring heteroIngest / heteroFinish. The op stream is
+      // read by `operationId` alone, so an owner-token caller (a logged-in
+      // desktop reusing its own OIDC session) must prove it owns THIS operation
+      // — otherwise any signed-in user could long-poll another run's
+      // `agent_intervention_response` payloads by id. Bind the guard to the
+      // operation row directly (tighter than the topic-level guard the write
+      // paths use, since the read has no topicId to key on). The operation-token
+      // path is exempt: it's server-minted and handed only to the sandbox /
+      // device running this op.
+      if (ctx.heteroAuthKind === 'user') {
+        const [operationRow] = await ctx.serverDB
+          .select({ userId: agentOperations.userId })
+          .from(agentOperations)
+          .where(eq(agentOperations.id, operationId))
+          .limit(1);
+
+        if (operationRow?.userId !== ctx.userId) {
+          throw new TRPCError({
+            code: 'FORBIDDEN',
+            message: 'Operation not found or not owned by the caller',
+          });
+        }
+      }
+
+      const streamEventManager = createStreamEventManager();
+      const { events, lastEventId: nextEventId } = await streamEventManager.readEventsOnce(
+        operationId,
+        lastEventId,
+        blockMs,
+      );
+
+      // Only intervention responses matter to the producer; everything else on
+      // the stream is already going out via its own outbound ingest path.
+      return {
+        events: events.filter((e) => e.type === 'agent_intervention_response'),
+        lastEventId: nextEventId,
+      };
+    }),
+
+  /**
+   * Browser leg of remote Human-in-the-loop (user auth). Publishes the user's
+   * answer to an `agent_intervention_request` back onto the op's Redis stream
+   * as an `agent_intervention_response`. Two consumers converge on it by
+   * `toolCallId`: the renderer (card → resolved) and the exec long-poll
+   * (`waitInterventionResponse` → `bridge.resolve`). Symmetric with the
+   * desktop path, which resolves the bridge over Electron IPC instead.
+   */
+  submitHeteroIntervention: aiAgentWriteProcedure
+    .input(SubmitHeteroInterventionSchema)
+    .mutation(async ({ input }) => {
+      const { operationId, toolCallId, stepIndex, result, cancelled, cancelReason } = input;
+
+      log(
+        'submitHeteroIntervention: op=%s toolCallId=%s cancelled=%s',
+        operationId,
+        toolCallId,
+        cancelled ?? false,
+      );
+
+      const streamEventManager = createStreamEventManager();
+      await streamEventManager.publishStreamEvent(operationId, {
+        data: {
+          cancelReason: cancelled ? (cancelReason ?? 'user_cancelled') : undefined,
+          cancelled,
+          result: cancelled ? undefined : result,
+          toolCallId,
+        },
+        stepIndex,
+        type: 'agent_intervention_response',
+      });
+
+      return { success: true as const };
+    }),
 
   processHumanIntervention: aiAgentWriteProcedure
     .input(ProcessHumanInterventionSchema)

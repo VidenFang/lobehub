@@ -7,6 +7,7 @@
   "config.header.title": "Obraz",
   "config.height.label": "Wysokość",
   "config.imageNum.label": "Liczba obrazów",
+  "config.imageUpload.maxCountReached": "Możesz dodać maksymalnie {{count}} obrazów referencyjnych",
   "config.imageUrl.label": "Obraz referencyjny",
   "config.imageUrls.label": "Obrazy referencyjne",
   "config.model.label": "Model",
@@ -62,6 +63,9 @@
   "topic.deleteConfirm": "Usuń temat generowania",
   "topic.deleteConfirmDesc": "Zamierzasz usunąć ten temat generowania. Tej operacji nie można cofnąć, proszę zachować ostrożność.",
   "topic.empty": "Brak tematów generowania",
+  "topic.privateTitle": "Prywatne",
   "topic.title": "Temat obrazu",
-  "topic.untitled": "Domyślny temat"
+  "topic.untitled": "Domyślny temat",
+  "topic.visibility.existingLocked": "Widoczność jest ustalona dla bieżącego tematu. Utwórz nowy temat, aby wybrać inną przestrzeń.",
+  "topic.workspaceTitle": "Przestrzeń robocza"
 }

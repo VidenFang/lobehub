@@ -233,6 +233,40 @@ describe('AgentModel', () => {
     });
   });
 
+  describe('getAgentSnapshotForTaskCreate', () => {
+    it('returns model/provider snapshot + visibility in one call', async () => {
+      const agentId = 'snap-task-create-1';
+      await serverDB.insert(agents).values({
+        id: agentId,
+        model: 'claude-sonnet-4-6',
+        provider: 'anthropic',
+        userId,
+        visibility: 'private',
+      });
+
+      const result = await agentModel.getAgentSnapshotForTaskCreate(agentId);
+
+      expect(result).toEqual({
+        snapshot: { model: 'claude-sonnet-4-6', provider: 'anthropic' },
+        visibility: 'private',
+      });
+    });
+
+    it('returns null when the agent is not visible to the current caller', async () => {
+      const agentId = 'snap-task-create-other-user';
+      await serverDB.insert(agents).values({
+        id: agentId,
+        model: 'gpt-4o',
+        provider: 'openai',
+        userId: userId2,
+      });
+
+      const result = await agentModel.getAgentSnapshotForTaskCreate(agentId);
+
+      expect(result).toBeNull();
+    });
+  });
+
   describe('getAgentConfig', () => {
     it('should find agent by ID', async () => {
       const agentId = 'test-agent-by-id';
@@ -1685,6 +1719,26 @@ describe('AgentModel', () => {
       expect(result[0]).toHaveProperty('backgroundColor');
     });
 
+    it('should derive heteroType from agencyConfig.heterogeneousProvider', async () => {
+      await serverDB.insert(agents).values({
+        agencyConfig: { heterogeneousProvider: { type: 'claude-code' } },
+        id: 'hetero-agent',
+        title: 'CC 2号机',
+        userId,
+        virtual: false,
+      });
+      await agentModel.create({ title: 'Normal Agent', virtual: false });
+
+      const result = await agentModel.queryAgents();
+
+      const hetero = result.find((a) => a.id === 'hetero-agent');
+      const normal = result.find((a) => a.title === 'Normal Agent');
+      expect(hetero?.heteroType).toBe('claude-code');
+      expect(normal?.heteroType).toBeUndefined();
+      // raw agencyConfig must not leak into the result payload
+      expect(hetero).not.toHaveProperty('agencyConfig');
+    });
+
     it('should exclude virtual agents', async () => {
       // Create a virtual agent
       await agentModel.create({
@@ -1878,6 +1932,36 @@ describe('AgentModel', () => {
       });
 
       expect(await agentModel.countAgents()).toBe(1);
+    });
+
+    it('should apply endDate / startDate / range filters against createdAt', async () => {
+      await serverDB.insert(agents).values([
+        {
+          id: 'old-agent',
+          title: 'Old Agent',
+          userId,
+          virtual: false,
+          createdAt: new Date('2024-01-01T00:00:00Z'),
+        },
+        {
+          id: 'mid-agent',
+          title: 'Mid Agent',
+          userId,
+          virtual: false,
+          createdAt: new Date('2024-06-01T00:00:00Z'),
+        },
+        {
+          id: 'new-agent',
+          title: 'New Agent',
+          userId,
+          virtual: false,
+          createdAt: new Date('2024-12-01T00:00:00Z'),
+        },
+      ]);
+
+      expect(await agentModel.countAgents({ endDate: '2024-03-01' })).toBe(1);
+      expect(await agentModel.countAgents({ startDate: '2024-07-01' })).toBe(1);
+      expect(await agentModel.countAgents({ range: ['2024-05-01', '2024-07-01'] })).toBe(1);
     });
   });
 

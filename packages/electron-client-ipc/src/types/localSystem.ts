@@ -248,7 +248,18 @@ export interface ProjectFileIndexResult {
   indexedAt: string;
   root: string;
   source: 'git' | 'glob';
-  totalCount: number;
+}
+
+export interface ProjectFileSearchParams extends ProjectFileIndexParams {
+  limit?: number;
+  query: string;
+}
+
+export interface ProjectFileSearchResult {
+  entries: ProjectFileIndexEntry[];
+  root: string;
+  searchedAt: string;
+  source: 'git' | 'glob';
 }
 
 export interface OpenLocalFileParams {
@@ -272,9 +283,14 @@ export interface RunCommandParams {
 }
 
 export interface RunCommandResult {
+  duration_ms?: number;
   error?: string;
   exit_code?: number;
   output?: string;
+  output_files?: {
+    stderr: { path: string; size: number; truncated: boolean };
+    stdout: { path: string; size: number; truncated: boolean };
+  };
   shell_id?: string;
   stderr?: string;
   stdout?: string;
@@ -292,6 +308,7 @@ export interface GetCommandOutputParams {
 }
 
 export interface GetCommandOutputResult {
+  duration_ms?: number;
   error?: string;
   /**
    * Present only after the command has exited.
@@ -300,6 +317,10 @@ export interface GetCommandOutputResult {
    */
   exit_code?: number;
   output: string;
+  output_files?: {
+    stderr: { path: string; size: number; truncated: boolean };
+    stdout: { path: string; size: number; truncated: boolean };
+  };
   stderr: string;
   stdout: string;
   success: boolean;
@@ -349,6 +370,8 @@ export interface GrepContentResult {
 
 // Glob types — same rationale as Grep above.
 export interface GlobFilesParams {
+  /** Maximum number of results to collect. When omitted, callers may apply their own default. */
+  limit?: number;
   pattern: string;
   /** Working directory scope. When `pattern` is relative, it is joined with this scope. Defaults to the current working directory. */
   scope?: string;

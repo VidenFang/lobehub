@@ -30,7 +30,7 @@ export interface GeneratePlanParams {
   /**
    * When the run opted into verify but produced no decomposed criteria, synthesize
    * a single agent-type holistic check (the coarse "one broad agent verify"
-   * default, LOBE-10755) instead of leaving an empty plan (→ verify no-op).
+   * default) instead of leaving an empty plan (→ verify no-op).
    */
   holisticFallback?: boolean;
   maxAiCriteria?: number;
@@ -70,7 +70,7 @@ export interface CriterionDraft {
  * requirement (or its goal). The agent verifier investigates the whole
  * deliverable and submits one verdict — the coarse "one broad agent verify"
  * default for tasks that opted into verify without decomposing into criteria
- * (LOBE-10755). No `requiredEvidence` hard gate: the agent self-captures, so the
+ * No `requiredEvidence` hard gate: the agent self-captures, so the
  * structural gate never marks it uncertain for "missing evidence".
  */
 const buildHolisticAgentItem = (requirement?: string, goal?: string): VerifyCheckItem => {
@@ -114,14 +114,33 @@ export class VerifyPlanGeneratorService {
   private readonly rubricModel: VerifyRubricModel;
   private readonly runModel: VerifyRunModel;
   private readonly documentModel: DocumentModel;
+  /**
+   * Visibility of the agent that triggered this plan (only set when invoked
+   * from a tool runtime). Threaded into every instruction-document create so
+   * private-agent verify criteria stay in the caller's private Pages bucket
+   * instead of leaking to the workspace.
+   */
+  private readonly callerAgentVisibility?: 'private' | 'public' | null;
 
-  constructor(db: LobeChatDatabase, userId: string, workspaceId?: string) {
+  constructor(
+    db: LobeChatDatabase,
+    userId: string,
+    workspaceId?: string,
+    callerAgentVisibility?: 'private' | 'public' | null,
+  ) {
     this.db = db;
     this.userId = userId;
+    this.callerAgentVisibility = callerAgentVisibility;
     this.criterionModel = new VerifyCriterionModel(db, userId, workspaceId);
     this.rubricModel = new VerifyRubricModel(db, userId, workspaceId);
     this.runModel = new VerifyRunModel(db, userId, workspaceId);
-    this.documentModel = new DocumentModel(db, userId, workspaceId);
+    this.documentModel = new DocumentModel(db, userId, workspaceId, callerAgentVisibility);
+  }
+
+  private get inheritedVisibility(): { visibility: 'private' | 'public' } | Record<string, never> {
+    return this.callerAgentVisibility === 'private' || this.callerAgentVisibility === 'public'
+      ? { visibility: this.callerAgentVisibility }
+      : {};
   }
 
   /**
@@ -162,6 +181,7 @@ export class VerifyPlanGeneratorService {
           title: draft.title,
           totalCharCount: draft.instruction.length,
           totalLineCount: draft.instruction.split('\n').length,
+          ...this.inheritedVisibility,
         });
         documentId = doc.id;
       }
@@ -286,6 +306,7 @@ export class VerifyPlanGeneratorService {
           title: draft.title,
           totalCharCount: draft.instruction.length,
           totalLineCount: draft.instruction.split('\n').length,
+          ...this.inheritedVisibility,
         });
         documentId = doc.id;
       }
@@ -420,6 +441,7 @@ export class VerifyPlanGeneratorService {
             title: c.title,
             totalCharCount: c.instruction.length,
             totalLineCount: c.instruction.split('\n').length,
+            ...this.inheritedVisibility,
           });
           documentId = doc.id;
         }

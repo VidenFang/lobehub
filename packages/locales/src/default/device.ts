@@ -16,6 +16,7 @@ export default {
   'workingDirectory.checkoutFailed': 'Checkout failed',
   'workingDirectory.chooseDifferentFolder': 'Choose a folder...',
   'workingDirectory.clear': 'Clear',
+  'workingDirectory.clean': 'clean',
   'workingDirectory.createBranchAction': 'Checkout new branch…',
   'workingDirectory.createBranchTitle': 'Create new branch',
   'workingDirectory.current': 'Current working directory',
@@ -34,6 +35,8 @@ export default {
   'workingDirectory.filesModified': 'Modified',
   'workingDirectory.ghMissing':
     'Install and log in to the GitHub CLI (`gh`) to see linked pull requests',
+  'workingDirectory.heteroHint':
+    'This agent always runs inside a working directory. Until you pick one, it uses a default folder — choose another below to change it.',
   'workingDirectory.newBranchPlaceholder': 'feature/new-branch-name',
   'workingDirectory.noRecent': 'No recent directories',
   'workingDirectory.notSet': 'Click to set working directory',
@@ -65,4 +68,21 @@ export default {
   'workingDirectory.topicOverride': 'Override for this conversation',
   'workingDirectory.uncommittedChanges_one': 'Uncommitted changes: {{count}} file',
   'workingDirectory.uncommittedChanges_other': 'Uncommitted changes: {{count}} files',
+  'workingDirectory.bareWorktree': 'bare',
+  'workingDirectory.currentWorktree': 'current',
+  'workingDirectory.detachedHeadShort': 'detached@{{sha}}',
+  'workingDirectory.detachedWorktree': 'detached',
+  'workingDirectory.lockedWorktree': 'locked',
+  'workingDirectory.prunableWorktree': 'prunable',
+  'workingDirectory.removeWorktreeAction': 'Delete worktree',
+  'workingDirectory.removeWorktreeConfirm':
+    'Delete worktree “{{name}}”? This removes the worktree directory but keeps its branch. Git will refuse if it has uncommitted changes.',
+  'workingDirectory.removeWorktreeFailed': 'Delete worktree failed',
+  'workingDirectory.removeWorktreeSuccess': 'Worktree deleted',
+  'workingDirectory.removeWorktreeTitle': 'Delete worktree',
+  'workingDirectory.worktreeCount': '{{count}} worktrees',
+  'workingDirectory.worktreeSwitchDescription': 'Switch the current conversation working directory',
+  'workingDirectory.worktreeUnavailable': 'unavailable',
+  'workingDirectory.worktreesEmpty': 'No worktrees found',
+  'workingDirectory.worktreesHeading': 'Worktrees',
 };

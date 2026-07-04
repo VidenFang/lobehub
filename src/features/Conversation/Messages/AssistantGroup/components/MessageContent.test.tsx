@@ -9,6 +9,7 @@ import MessageContent from './MessageContent';
 
 let mockStoreContent = 'original full content';
 let mockStoreHasTools = true;
+let mockStoreMessage: { createdAt?: number } | undefined = { createdAt: 1000 };
 
 vi.mock('antd-style', () => ({
   createStaticStyles: () => ({
@@ -33,14 +34,17 @@ vi.mock('../../../store', () => ({
   dataSelectors: {
     getBlockContent: () => () => mockStoreContent,
     getBlockHasTools: () => () => mockStoreHasTools,
+    getDbMessageById: () => () => mockStoreMessage,
   },
   useConversationStore: (selector: (state: unknown) => unknown) => selector({}),
 }));
 
-const useMarkdownMock = vi.fn(() => ({}));
+type UseMarkdownArgs = [id: string, disableStreaming?: boolean];
+
+const useMarkdownMock = vi.fn((..._args: UseMarkdownArgs) => ({}));
 
 vi.mock('../useMarkdown', () => ({
-  useMarkdown: (...args: unknown[]) => useMarkdownMock(...args),
+  useMarkdown: (...args: UseMarkdownArgs) => useMarkdownMock(...args),
 }));
 
 describe('MessageContent', () => {
@@ -49,6 +53,7 @@ describe('MessageContent', () => {
     useMarkdownMock.mockClear();
     mockStoreContent = 'original full content';
     mockStoreHasTools = true;
+    mockStoreMessage = { createdAt: 1000 };
   });
 
   it('renders explicit content override instead of the same-id store content', () => {

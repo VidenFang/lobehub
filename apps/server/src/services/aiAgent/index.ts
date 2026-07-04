@@ -16,6 +16,7 @@ import { TaskIdentifier } from '@lobechat/builtin-tool-task';
 import { builtinTools, manualModeExcludeToolIds } from '@lobechat/builtin-tools';
 import { LOADING_FLAT } from '@lobechat/const';
 import type {
+  AgentGroupConfig,
   AgentManagementContext,
   BotPlatformContext,
   LobeToolManifest,
@@ -45,12 +46,14 @@ import type {
 } from '@lobechat/types';
 import { buildHeteroExecArgs, RequestTrigger, ThreadStatus, ThreadType } from '@lobechat/types';
 import { nanoid } from '@lobechat/utils';
+import { TRPCError } from '@trpc/server';
 import debug from 'debug';
 
 import { AgentModel } from '@/database/models/agent';
 import { AgentOperationModel } from '@/database/models/agentOperation';
 import { AgentSkillModel } from '@/database/models/agentSkill';
 import { AiModelModel } from '@/database/models/aiModel';
+import { ChatGroupModel } from '@/database/models/chatGroup';
 import { ConnectorModel } from '@/database/models/connector';
 import { ConnectorToolModel } from '@/database/models/connectorTool';
 import { DeviceModel } from '@/database/models/device';
@@ -88,7 +91,8 @@ import type {
 } from '@/server/services/agentRuntime';
 import { AgentRuntimeService } from '@/server/services/agentRuntime';
 import { getAbortError, isAbortError, throwIfAborted } from '@/server/services/agentRuntime/abort';
-import { dispatchTerminalHooks, hookDispatcher } from '@/server/services/agentRuntime/hooks';
+import { CompletionLifecycle } from '@/server/services/agentRuntime/CompletionLifecycle';
+import { hookDispatcher } from '@/server/services/agentRuntime/hooks';
 import type { AgentHook } from '@/server/services/agentRuntime/hooks/types';
 import type {
   ExecGroupMemberParams,
@@ -107,6 +111,7 @@ import {
 import { shouldSuppressSignal } from '@/server/services/agentSignal/suppressSignal';
 import { ComposioService } from '@/server/services/composio';
 import { deviceGateway } from '@/server/services/deviceGateway';
+import { getScopedOnlineDevices } from '@/server/services/deviceGateway/scopedDevices';
 import { DocumentService } from '@/server/services/document';
 import { FileService } from '@/server/services/file';
 import { resolveAttachmentsByFileIds } from '@/server/services/file/resolveAttachments';
@@ -120,6 +125,7 @@ import { markdownToTxt } from '@/utils/markdownToTxt';
 import { resolveDeviceAccessPolicy } from './deviceAccessPolicy';
 import { buildAllowedBuiltinTools, isDeviceToolIdentifier } from './deviceToolRegistry';
 import { ingestAttachment } from './ingestAttachment';
+import { pruneRegeneratedBranch } from './pruneRegeneratedBranch';
 import { resolveDeviceWorkingDirectory } from './resolveDeviceWorkingDirectory';
 import { isWorkspaceCacheFresh, upsertWorkspaceScan } from './workspaceInitCache';
 
@@ -176,6 +182,72 @@ const isVisualUnderstandingConfigured = () => {
     // The env proxy rejects server-only keys in client-like runtimes; treat that as disabled.
     return false;
   }
+};
+
+/**
+ * Build the multi-agent group context from a group's member roster, mirroring
+ * the client `contextEngineering.ts` `agentGroup` build. Carries every member's
+ * real `agt_*` ID so the supervisor dispatches members by ID instead of role
+ * name (role names don't resolve → "Agent member(s) failed to start."). Resolves
+ * the responding agent's own role/name so GroupContextInjector marks it with
+ * `you="true"` and the orchestration filter activates for participants.
+ */
+const buildGroupAgentContext = (
+  currentAgentId: string,
+  group: { content?: string | null; title?: string | null } | undefined,
+  roster: Array<{ agentId: string; role: string | null; title: string | null }>,
+): AgentGroupConfig | undefined => {
+  if (roster.length === 0) return undefined;
+
+  const agentMap: AgentGroupConfig['agentMap'] = {};
+  const members: NonNullable<AgentGroupConfig['members']> = [];
+  let currentAgentName: string | undefined;
+  let currentAgentRole: 'supervisor' | 'participant' | undefined;
+
+  for (const member of roster) {
+    const role = member.role === 'supervisor' ? 'supervisor' : 'participant';
+    const name = member.title?.trim() || 'Untitled Agent';
+    agentMap[member.agentId] = { name, role };
+    members.push({ id: member.agentId, name, role });
+
+    if (member.agentId === currentAgentId) {
+      currentAgentName = name;
+      currentAgentRole = role;
+    }
+  }
+
+  return {
+    agentMap,
+    currentAgentId,
+    currentAgentName,
+    currentAgentRole,
+    groupTitle: group?.title || undefined,
+    members,
+    systemPrompt: group?.content || undefined,
+  };
+};
+
+/**
+ * Bot-conversation fallback: a single bot agent has no real group, so build a
+ * degenerate one-member context purely to give it its `<group_context>`
+ * identity block. Only used when there is no `groupId`.
+ */
+const buildBotConversationGroupContext = (
+  currentAgentId: string,
+  agentConfig: { description?: unknown; title?: unknown } | undefined,
+): AgentGroupConfig => {
+  const title = agentConfig?.title;
+  const description = agentConfig?.description;
+  const name = typeof title === 'string' && title.trim() ? title.trim() : 'Current Agent';
+
+  return {
+    agentMap: { [currentAgentId]: { name, role: 'participant' } },
+    currentAgentId,
+    currentAgentName: name,
+    currentAgentRole: 'participant',
+    members: [{ id: currentAgentId, name, role: 'participant' }],
+    systemPrompt: typeof description === 'string' ? description : undefined,
+  };
 };
 
 /**
@@ -248,6 +320,14 @@ interface InternalExecAgentParams extends ExecAgentParams {
     rejectionReason?: string;
     toolCallId: string;
   };
+  /**
+   * Tool identifiers the user @-mentioned in this message. Merged into the
+   * agent's plugin set for this run (alongside `additionalPluginIds`) so a
+   * mentioned tool that isn't pinned to the agent — e.g. a custom MCP connector
+   * picked from the @ list — is enabled and callable. User-scoped lookups
+   * downstream (connectors, installed plugins) keep it to the caller's own tools.
+   */
+  selectedToolIds?: string[];
   /** Abort startup before the agent runtime operation is created */
   signal?: AbortSignal;
   /**
@@ -403,12 +483,13 @@ export class AiAgentService {
    * each one would strand the run: the assistant bubble would show an error but
    * the UI stream would never close and a long-run task would hang in `running`.
    *
-   * Routes through the SAME terminal funnel a normal exit uses — it fires the
-   * run's onComplete/onError hooks via `dispatchTerminalHooks`, so the task
-   * lifecycle (onTopicComplete → task failed) and any IM bot completion callback
-   * fire exactly as they would for a real failure — then closes the UI stream and
-   * clears the (never-started) running operation. The hooks were registered and
-   * serialized onto `runningOperation` at dispatch time.
+   * Routes through the SAME terminal funnel a normal exit uses —
+   * `CompletionLifecycle.completeOperation` finalizes the op row and fires the
+   * run's onComplete/onError hooks, so the task lifecycle (onTopicComplete → task
+   * failed) and any IM bot completion callback fire exactly as they would for a
+   * real failure — then closes the UI stream and clears the (never-started)
+   * running operation. The hooks were registered and serialized onto
+   * `runningOperation` at dispatch time.
    *
    * Stream-close / hook dispatch / metadata clear are best-effort: a failure
    * there must not mask the original dispatch error the caller surfaces.
@@ -430,20 +511,27 @@ export class AiAgentService {
       error: { body: { detail }, message, type: 'ServerAgentRuntimeError' },
     });
 
-    // 1b. Mark the agent_operations row terminal. The row was inserted at
-    //     recordStart, but a dispatch failure goes through THIS path, not
-    //     heteroFinish — so without this the row stays status='running' forever
-    //     and pollutes operation-lifecycle / verify views for failed starts.
-    try {
-      await this.agentOperationModel.recordCompletion(operationId, {
-        completedAt: new Date(),
-        completionReason: 'error',
+    // 1b. Finalize the run through CompletionLifecycle's single entry — the SAME
+    //     owner the CLI exit (heteroFinish) / in-process paths use. It marks the
+    //     agent_operations row terminal (the row was inserted at recordStart, but a
+    //     dispatch failure goes through THIS path, not heteroFinish, so without
+    //     finalizing it the row stays status='running' forever) AND fires the run's
+    //     onComplete/onError hooks (task lifecycle → task failed + IM bot callback).
+    //     `skipErrorMessageWrite` keeps the bespoke device-specific bubble written
+    //     in step 1; verify is done-only, so it no-ops on this error path.
+    await new CompletionLifecycle(this.db, this.userId, this.workspaceId).completeOperation(
+      {
+        agentId,
+        assistantMessageId,
         error: { message, type: 'ServerAgentRuntimeError' },
-        status: 'error',
-      });
-    } catch (err) {
-      log('finalizeHeteroDispatchError: recordCompletion failed (non-fatal): %O', err);
-    }
+        operationId,
+        serializedHooks: hookDispatcher.getSerializedHooks(operationId),
+        topicId,
+        userId: this.userId,
+      },
+      'error',
+      { skipErrorMessageWrite: true },
+    );
 
     // 2. Close the UI stream.
     try {
@@ -458,21 +546,7 @@ export class AiAgentService {
       log('finalizeHeteroDispatchError: publishAgentRuntimeEnd failed (non-fatal): %O', err);
     }
 
-    // 3. Fire onComplete/onError hooks (task lifecycle + bot callback). Hooks
-    //    were registered in-memory (local mode) and serialized onto
-    //    runningOperation (queue mode) at dispatch time.
-    await dispatchTerminalHooks({
-      agentId,
-      errorMessage: message,
-      errorType: 'ServerAgentRuntimeError',
-      operationId,
-      reason: 'error',
-      serializedHooks: hookDispatcher.getSerializedHooks(operationId),
-      topicId,
-      userId: this.userId,
-    });
-
-    // 4. The operation never started — drop the running marker so reconnect /
+    // 3. The operation never started — drop the running marker so reconnect /
     //    heteroIngest validation and the next turn don't see a stale operation.
     try {
       await this.topicModel.updateMetadata(topicId, { runningOperation: null });
@@ -846,6 +920,7 @@ export class AiAgentService {
       parentOperationId,
       resume,
       resumeApproval,
+      selectedToolIds,
       suppressUserMessage,
       ephemeralUserMessage,
     } = params;
@@ -907,7 +982,12 @@ export class AiAgentService {
       agentConfig = await this.agentService.getAgentConfig(identifier);
     }
     if (!agentConfig) {
-      throw new Error(`Agent not found: ${identifier}`);
+      // `agentService.getAgentConfig` already routes through `AgentModel`'s
+      // workspace + visibility ownership predicate, so a cross-user private
+      // agent resolves to null here. Surface that as NOT_FOUND (not a generic
+      // 500) so callers — chat, bot, cron task, sub-agent, REST — return a
+      // uniform 404 and we never leak whether the id exists for another user.
+      throw new TRPCError({ code: 'NOT_FOUND', message: `Agent not found: ${identifier}` });
     }
 
     // Use actual agent ID from config for subsequent operations
@@ -1033,7 +1113,7 @@ export class AiAgentService {
       log('execAgent: appended additional instructions to systemRole');
     }
 
-    let resumeParentMessage;
+    let resumeParentMessage: Awaited<ReturnType<MessageModel['findById']>>;
 
     // `resumeApproval` implies the same "load parent message + skip user
     // message creation" semantics as `resume`. Callers that go through the
@@ -1186,7 +1266,7 @@ export class AiAgentService {
         // `topics.groupId`), so the conversation silently "disappears" from the
         // group. execGroupAgent normally pre-creates the topic, but any path
         // that reaches execAgent without a topicId (e.g. the async/queue run)
-        // must carry the groupId through too. (LOBE-10604 / LOBE-10627)
+        // must carry the groupId through too (group topic sidebar + ownership fix).
         groupId: appContext?.groupId,
         metadata,
         title:
@@ -1242,10 +1322,7 @@ export class AiAgentService {
     const heteroProviderType = agentConfig.agencyConfig?.heterogeneousProvider?.type;
     const isHeteroAgent = !!heteroProviderType || HETERO_AGENT_MODELS.has(model);
     const heteroType = (heteroProviderType ?? model) as
-      | 'claude-code'
-      | 'codex'
-      | 'hermes'
-      | 'openclaw';
+      'claude-code' | 'codex' | 'hermes' | 'openclaw';
 
     // ── Shared turn setup (runs for BOTH hetero and normal agents) ──────────
     // Everything up to and including persisting the turn is identical for both
@@ -1272,6 +1349,13 @@ export class AiAgentService {
     // exclude this freshly-created turn — history must be the PRIOR turns only,
     // otherwise the new prompt is double-counted in the LLM context.
     const selfMessageIds = new Set<string>();
+    const userMessageParentId =
+      runFromHistory || parentMessageId
+        ? undefined
+        : await this.messageModel.getLatestSpineMessageId?.({
+            threadId: appContext?.threadId ?? null,
+            topicId,
+          });
     const userMessageRecord = runFromHistory
       ? undefined
       : await this.messageModel.create({
@@ -1280,9 +1364,10 @@ export class AiAgentService {
           files: runAttachments.fileIds,
           // Group reads filter on messages.groupId (MessageModel.query group
           // branch), so a group turn must stamp groupId or the message never
-          // shows when the topic is reopened. (LOBE-10604 / LOBE-10627)
+          // shows when the topic is reopened (group topic sidebar + ownership fix).
           groupId: appContext?.groupId ?? undefined,
           metadata: requestTriggerMetadata,
+          parentId: userMessageParentId,
           role: 'user',
           threadId: appContext?.threadId ?? undefined,
           topicId,
@@ -1291,6 +1376,19 @@ export class AiAgentService {
       selfMessageIds.add(userMessageRecord.id);
       log('execAgent: created user message %s', userMessageRecord.id);
     }
+
+    // Snapshot the author's group orchestration role onto the assistant message
+    // so the role survives the server round-trip (gateway step_start snapshot /
+    // message.getMessages). Without this the client's optimistic isSupervisor flag
+    // is lost on refetch and the supervisor renders as a generic assistant.
+    // The persisted message `role` stays 'assistant' — only metadata carries the
+    // orchestration role, keeping the data training-friendly.
+    const orchestrationMetadata = appContext?.orchestrationRole
+      ? {
+          ...(appContext.orchestrationRole === 'supervisor' ? { isSupervisor: true } : {}),
+          orchestrationRole: appContext.orchestrationRole,
+        }
+      : undefined;
 
     // Assistant placeholder (shows the spinner in the UI). A hetero run seeds
     // ONLY the provider — the CLI reports the real model later via `stream_start`
@@ -1303,6 +1401,7 @@ export class AiAgentService {
       // Stamp groupId so the assistant turn is visible in the group read path
       // (MessageModel.query filters group chats by messages.groupId).
       groupId: appContext?.groupId ?? undefined,
+      metadata: orchestrationMetadata,
       model: isHeteroAgent ? undefined : model,
       parentId: parentMessageId ?? userMessageRecord?.id,
       provider: isHeteroAgent ? heteroType : provider,
@@ -1347,7 +1446,9 @@ export class AiAgentService {
 
     if (isHeteroAgent) {
       const isRemoteHetero = isRemoteHeterogeneousType(heteroType);
-      const operationId = nanoid();
+      // Same structured shape as the built-in path (`op_{ts}_{agentId}_{topicId}_{rand}`)
+      // so hetero ops aren't visually distinct bare nanoids in the trace/op tables.
+      const operationId = `op_${Date.now()}_${resolvedAgentId}_${topicId}_${nanoid(8)}`;
 
       // Persist a first-class agent_operations row for the hetero run. The id is
       // generated here (authoritative) and flows through to heteroIngest /
@@ -1355,16 +1456,32 @@ export class AiAgentService {
       // operation lifecycle: verify (ensureForOperation), repair (parent chain),
       // judge (op.model/provider) and tracing all key off it. Terminal state +
       // the trace snapshot are written back in heteroFinish. Non-fatal: a
-      // tracing/op-row insert hiccup must never fail the user's run (verify just
-      // degrades to off for this run).
+      // tracing/op-row insert hiccup must never fail the user's run.
       try {
-        await this.agentOperationModel.recordStart({
+        // Route through CompletionLifecycle — NOT the raw operation model — so the
+        // hetero run is a first-class lifecycle peer of the in-process runtime.
+        // recordStart additionally instantiates the task's verify plan when this
+        // is a top-level task op (taskId && !parentOperationId); the hetero finish
+        // side (heteroFinish → CompletionLifecycle.dispatchHooks) then runs the
+        // delivery-checker gate against that plan. Calling the bare operation model
+        // here is exactly what silently degraded verify to off for every hetero
+        // task run (the plan was never created at start).
+        await new CompletionLifecycle(this.db, this.userId, this.workspaceId).recordStart({
           agentId: persistAgentId,
           chatGroupId: appContext?.groupId ?? null,
           maxSteps,
-          model,
+          // Seed the heterogeneous provider (claude-code / codex / …), NOT the
+          // agent's configured chat provider — the run executes on the CLI, so
+          // `provider` (e.g. `lobehub`) and `model` (e.g. `deepseek-v4-pro`) are
+          // irrelevant. `model` is intentionally left unset: the real executed
+          // model arrives mid-stream and is backfilled by heteroFinish. Mirrors the
+          // assistant-message seeding above (provider: heteroType, model: undefined).
           operationId,
-          provider,
+          // Top-level dispatch carries no parent; pass it through so the verify
+          // plan gate (taskId && !parentOperationId) reads the real lineage and a
+          // repair/verifier sub-run never re-instantiates its own plan here.
+          parentOperationId,
+          provider: heteroType,
           taskId: operationTaskId ?? null,
           threadId: appContext?.threadId ?? null,
           topicId,
@@ -1652,6 +1769,34 @@ export class AiAgentService {
         // `canUseDevice` degrades device-capable targets to the sandbox for
         // denied senders (e.g. external bot users) — without it a synced
         // local/device binding would let them run on the owner's machine.
+
+        // Register the op with the agent-gateway DO before dispatch, mirroring
+        // the remote-hetero branch above. Local CLI hetero (claude-code / codex)
+        // streams back via heteroIngest, which forwards live events the DO can
+        // relay even without an init — so the FIRST run renders fine. But a later
+        // `reconnectToGatewayOperation` (task topic drawer open / page reload)
+        // sends a `resume` that asks the DO for the op's status; with no session
+        // record the DO answers terminal, the client fires `session_complete`,
+        // and `onSessionComplete` clears `topic.metadata.runningOperation`. The
+        // still-running CC's next heteroIngest batch then hits
+        // StaleHeteroOperationError and is silently dropped — the agent appears
+        // to stop the moment the window is opened. Seeding the init keeps the DO
+        // reporting `running`, so resume stays connected and keeps streaming.
+        // Best-effort: a stream-manager/Redis failure must never block dispatch —
+        // the init only powers reconnect, not the run. `createStreamEventManager`
+        // probes Redis synchronously, so guard construction too, not just publish.
+        try {
+          await createStreamEventManager().publishAgentRuntimeInit(operationId, {
+            agentId: resolvedAgentId,
+            assistantMessageId: assistantMessageRecord.id,
+            heteroType,
+            topicId,
+            userId: this.userId,
+          });
+        } catch (err) {
+          log('execAgent: failed to init stream for local hetero: %O', err);
+        }
+
         const heteroPlan = resolveExecutionPlan({
           agencyConfig: agentConfig.agencyConfig,
           canUseDevice,
@@ -1824,6 +1969,9 @@ export class AiAgentService {
     const agentMemoryEnabled = agentConfig.chatConfig?.memory?.enabled;
     let globalMemoryEnabled = agentMemoryEnabled ?? false;
     let userTimezone: string | undefined;
+    // Resolved once below (alongside the group-tool authorization fetch) and
+    // forwarded into op metadata for the per-step context engine.
+    let operationAgentGroup: AgentGroupConfig | undefined;
     try {
       const userModel = new UserModel(this.db, this.userId);
       const settings = await userModel.getUserSettings();
@@ -1867,7 +2015,17 @@ export class AiAgentService {
     let lobehubSkillManifests: LobeToolManifest[] = [];
     let composioManifests: LobeToolManifest[] = [];
     let connectorManifests: ReturnType<typeof buildConnectorManifests> = [];
-    let agentPlugins: string[] = [...(agentConfig?.plugins ?? []), ...(additionalPluginIds || [])];
+    // `selectedToolIds` are the user's @-mention picks for this turn; merged in
+    // (deduped) alongside the agent's pinned plugins and any internal
+    // `additionalPluginIds` so a mentioned-but-not-pinned tool (e.g. a custom MCP
+    // connector) is both queried for manifests and enabled by the tools engine.
+    let agentPlugins: string[] = [
+      ...new Set([
+        ...(agentConfig?.plugins ?? []),
+        ...(additionalPluginIds || []),
+        ...(selectedToolIds || []),
+      ]),
+    ];
 
     // Model metadata is needed both for tool support checks and agent-management context.
     const { loadModels } = await import('@/business/client/model-bank/loadModels');
@@ -1907,6 +2065,40 @@ export class AiAgentService {
         historyMessagesCache = messages.filter((msg) => !selfMessageIds.has(msg.id));
       } else {
         historyMessagesCache = [];
+      }
+
+      // ── Regenerate: drop the anchor user message's existing answer branch ──
+      // In gateway/server runtime mode the client only sends `parentMessageId`
+      // (the user message being regenerated) and lets the server rebuild the
+      // context. The topic query above still returns the anchor's *previous*
+      // assistant branch (the answer being replaced) and — when a middle turn is
+      // regenerated — the later turns that continued from it. Leaving them in
+      // makes the model see an already-answered turn and "continue" it instead of
+      // producing a fresh answer (`[U1, A1]` → continue rather than `[U1]` → A2).
+      //
+      // The branch must be pruned even after `/compact`: compaction hides the
+      // grouped messages and `query` returns a synthetic `compressedGroup` node
+      // that carries neither `parentId` nor (for compaction) the group's
+      // `parentMessageId`, so ancestry can't be walked from `query` output alone.
+      // We load the raw message tree (including hidden/compacted messages) and
+      // compute the anchor's descendants from it, then drop both regular
+      // descendant messages and any group node whose members fall in that branch.
+      //
+      // Scoped to a `user`-role anchor: the human-approval resume path anchors on
+      // a tool message and must keep the in-flight turn (including parallel-tool
+      // sibling messages) intact, so it is intentionally left untouched.
+      if (
+        historyMessagesCache &&
+        effectiveResume &&
+        parentMessageId &&
+        resumeParentMessage?.role === 'user' &&
+        appContext?.topicId
+      ) {
+        const tree = await this.messageModel.queryTopicMessageTree({
+          threadId: appContext.threadId,
+          topicId: appContext.topicId,
+        });
+        historyMessagesCache = pruneRegeneratedBranch(historyMessagesCache, tree, parentMessageId);
       }
 
       return historyMessagesCache;
@@ -2075,16 +2267,16 @@ export class AiAgentService {
       const boundDeviceId = topicBoundDeviceId || agentBoundDeviceId;
       if (gatewayConfigured) {
         try {
-          // Personal pool (user principal) ∪ the current workspace's shared pool
-          // (workspace principal). Workspace devices are absent for non-workspace
-          // runs, so this is identical to the personal-only fetch there.
-          const [personalOnline, workspaceOnline] = await Promise.all([
-            deviceGateway.queryDeviceList(this.userId),
-            this.workspaceId
-              ? deviceGateway.queryDeviceList(this.userId, this.workspaceId)
-              : Promise.resolve([]),
-          ]);
-          onlineDevices = [...personalOnline, ...workspaceOnline];
+          // Personal pool ∪ the current workspace pool, DB rows ⊕ gateway online,
+          // tagged with `scope` and the user-set `friendlyName` alias (see
+          // `getScopedOnlineDevices`) so the systemRole snapshot lets the model
+          // tell a personal machine apart from its workspace-enrolled counterpart
+          // (same physical machine under both principals). Keep only live devices:
+          // downstream `onlineDeviceIds` / `deviceOnline` treat this list as the
+          // online set.
+          onlineDevices = (
+            await getScopedOnlineDevices(this.db, this.userId, this.workspaceId)
+          ).filter((d) => d.online);
           log('execAgent: found %d online device(s)', onlineDevices.length);
         } catch (error) {
           log('execAgent: failed to query device list: %O', error);
@@ -2177,6 +2369,40 @@ export class AiAgentService {
         activeDeviceId ?? 'none',
       );
 
+      // Resolve the operation's group context ONCE here and snapshot it into op
+      // metadata below — the per-step context engine reads it back without a DB
+      // lookup, mirroring agentConfig/botContext. The same roster fetch also
+      // authorizes the group-orchestration toolset.
+      let isGroupSupervisor = false;
+      if (appContext?.groupId) {
+        const chatGroupModel = new ChatGroupModel(this.db, this.userId, this.workspaceId);
+        const [group, roster] = await Promise.all([
+          chatGroupModel.findById(appContext.groupId),
+          chatGroupModel.getGroupAgentsWithMeta(appContext.groupId),
+        ]);
+
+        // `appContext.orchestrationRole` is client-supplied (execGroupAgent stamps
+        // it for whatever agentId the caller passed), so it must NOT alone
+        // authorize the group-orchestration toolset — otherwise any run marked
+        // `{ orchestrationRole: 'supervisor', groupId }` could dispatch members.
+        // Verify against the persisted, ownership-scoped membership instead.
+        if (appContext.orchestrationRole === 'supervisor') {
+          isGroupSupervisor = roster.some(
+            (member) => member.agentId === resolvedAgentId && member.role === 'supervisor',
+          );
+          if (!isGroupSupervisor)
+            log(
+              'execAgent: orchestrationRole=supervisor but agent %s is not the supervisor of group %s — denying group tools',
+              resolvedAgentId,
+              appContext.groupId,
+            );
+        }
+
+        operationAgentGroup = buildGroupAgentContext(resolvedAgentId, group, roster);
+      } else if (botContext) {
+        operationAgentGroup = buildBotConversationGroupContext(resolvedAgentId, agentConfig);
+      }
+
       const toolsEngine = createServerAgentToolsEngine(toolsContext, {
         additionalManifests: [
           ...lobehubSkillManifests,
@@ -2201,6 +2427,15 @@ export class AiAgentService {
         globalMemoryEnabled,
         hasEnabledKnowledgeBases,
         isBotConversation,
+        isGroupSupervisor,
+        // Context-aware builtin manifests: inside a sub-agent (or group) run,
+        // lobe-agent drops `callSubAgent` so the model can't recurse into nested
+        // sub-agents (which the runtime rejects, looping until the inactivity
+        // watchdog kills the op). Mirrors the frontend `createAgentToolsEngine`.
+        manifestContext: {
+          isSubAgent: appContext?.isSubAgent,
+          scope: appContext?.scope ?? undefined,
+        },
         model,
         provider,
       });
@@ -2978,6 +3213,7 @@ export class AiAgentService {
       const result = await this.agentRuntimeService.createOperation({
         activeDeviceId,
         agentConfig,
+        agentGroup: operationAgentGroup,
         deviceSystemInfo: Object.keys(deviceSystemInfo).length > 0 ? deviceSystemInfo : undefined,
         executionPlan,
         userTimezone,
@@ -3004,6 +3240,10 @@ export class AiAgentService {
           documentId: appContext?.documentId,
           groupId: appContext?.groupId,
           isSubAgent: appContext?.isSubAgent,
+          // Persist the orchestration role on state.metadata so the
+          // inactivity-watchdog abandon path can distinguish an isolated group
+          // member ('member') from a genuine callSubAgent child.
+          orchestrationRole: appContext?.orchestrationRole,
           scope: appContext?.scope,
           sourceMessageId: userMessageRecord?.id ?? parentMessageId ?? undefined,
           taskId: operationTaskId,
@@ -3166,10 +3406,13 @@ export class AiAgentService {
       log('execGroupAgent: created new topic %s with groupId %s', topicId, groupId);
     }
 
-    // 2. Delegate to execAgent with groupId in appContext
+    // 2. Delegate to execAgent with groupId in appContext.
+    // execGroupAgent always runs the group's supervisor, so stamp the
+    // orchestration role onto the run — it lands on the assistant message
+    // metadata and drives supervisor-flavored UI rendering.
     const result = await this.execAgent({
       agentId,
-      appContext: { groupId, topicId },
+      appContext: { groupId, orchestrationRole: 'supervisor', topicId },
       autoStart: true,
       prompt: message,
       trigger: RequestTrigger.Chat,
@@ -3256,6 +3499,9 @@ export class AiAgentService {
             }),
           isSubAgent: true,
           logScope: 'execVirtualSubAgent',
+          // Tag the op as a group member so the abandon path routes its parent
+          // resume through the group bridge (its own timeout), not the sub-agent one.
+          orchestrationRole: 'member',
           resumeParentOnComplete: true,
         },
       );
@@ -3307,6 +3553,7 @@ export class AiAgentService {
       instruction,
       onComplete,
       parentOperationId,
+      supervisorMessageId,
       topicId,
     } = params;
 
@@ -3343,6 +3590,7 @@ export class AiAgentService {
 
     const appContext: NonNullable<InternalExecAgentParams['appContext']> = {
       groupId,
+      orchestrationRole: 'member',
       scope: 'group',
       topicId,
     };
@@ -3350,6 +3598,17 @@ export class AiAgentService {
     // The member runs as a child op of the supervisor and lands its turns in the
     // shared group conversation (no isolation thread). The bridge backfills the
     // member anchor (a short receipt) and resumes/finishes the supervisor.
+    //
+    // The member response attaches to the SUPERVISOR ASSISTANT message that owns
+    // this group-management tool call (`supervisorMessageId`), NOT to the tool
+    // message. For a multi-member broadcast the member assistants are therefore
+    // siblings of the `agentCouncil` tool under one supervisor turn, and the
+    // renderer groups them into a single parallel-streaming council card. The tool
+    // message stays a pure result and the per-member anchors stay under it for the
+    // K=N barrier only. This keeps the tool node clean and lets parallel speak/
+    // broadcast turns render without the UI discontinuity the old tool-parented
+    // shape caused. Falls back to the group tool message if no supervisor id was
+    // threaded through (e.g. single-member collapses onto the tool anyway).
     //
     // The supervisor instruction is injected as an EPHEMERAL user message
     // (`suppressUserMessage` + `ephemeralUserMessage`): it drives the member's
@@ -3373,7 +3632,7 @@ export class AiAgentService {
           parentOperationId,
         }),
       ],
-      parentMessageId: anchorMessageId,
+      parentMessageId: supervisorMessageId ?? groupToolMessageId,
       parentOperationId,
       prompt: speakerInstruction,
       suppressUserMessage: true,
@@ -3406,6 +3665,15 @@ export class AiAgentService {
       bridgeHookFactory?: (threadId: string) => AgentHook;
       isSubAgent: boolean;
       logScope: 'execSubAgent' | 'execVirtualSubAgent';
+      /**
+       * Marks the run's orchestration role on its operation metadata. Isolated
+       * group members pass `'member'` so the inactivity-watchdog abandon path can
+       * tell them apart from genuine `callSubAgent` children — both share
+       * `isSubAgent: true` and an isolation thread, but a member's parent is
+       * resumed through the group K=N bridge (via its own group-member timeout),
+       * NOT `completeSubAgentBridge`.
+       */
+      orchestrationRole?: 'member';
       resumeParentOnComplete?: boolean;
     },
   ): Promise<ExecSubAgentResult> {
@@ -3493,6 +3761,7 @@ export class AiAgentService {
     const appContext: NonNullable<InternalExecAgentParams['appContext']> = {
       groupId,
       isSubAgent: options.isSubAgent,
+      orchestrationRole: options.orchestrationRole,
       threadId: thread.id,
       topicId,
     };
@@ -4001,8 +4270,7 @@ export class AiAgentService {
     if (topicId) {
       const topic = await this.topicModel.findById(topicId);
       const runningOp = (topic?.metadata as any)?.runningOperation as
-        | { deviceId?: string; heteroType?: string; operationId?: string }
-        | undefined;
+        { deviceId?: string; heteroType?: string; operationId?: string } | undefined;
 
       if (
         runningOp?.deviceId &&

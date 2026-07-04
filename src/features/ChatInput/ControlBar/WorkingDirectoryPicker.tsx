@@ -1,6 +1,8 @@
 'use client';
 
 import { isDesktop } from '@lobechat/const';
+import type { WorkingDirEntry } from '@lobechat/types';
+import { getWorkingDirEffectivePath } from '@lobechat/types';
 import { Flexbox, Icon, Popover, Tooltip } from '@lobehub/ui';
 import { createStaticStyles, cssVar, cx } from 'antd-style';
 import {
@@ -9,6 +11,7 @@ import {
   FolderIcon,
   FolderOpenIcon,
   FolderPlusIcon,
+  InfoIcon,
   XIcon,
 } from 'lucide-react';
 import { memo, useState } from 'react';
@@ -124,6 +127,19 @@ const styles = createStaticStyles(({ css }) => ({
     color: ${cssVar.colorTextDescription};
     text-overflow: ellipsis;
     white-space: nowrap;
+  `,
+  hint: css`
+    margin-block: 2px 4px;
+    margin-inline: 4px;
+    padding-block: 6px;
+    padding-inline: 8px;
+    border-radius: ${cssVar.borderRadius};
+
+    font-size: 12px;
+    line-height: 1.5;
+    color: ${cssVar.colorTextSecondary};
+
+    background: ${cssVar.colorFillQuaternary};
   `,
   removeBtn: css`
     cursor: pointer;
@@ -256,6 +272,10 @@ const WorkingDirectoryPicker = memo<WorkingDirectoryPickerProps>(({ agentId }) =
   useMigrateDeviceRecents();
 
   const agencyConfig = useAgentStore(agentByIdSelectors.getAgencyConfigById(agentId));
+  // Derive hetero-ness from the agencyConfig already in hand — `heterogeneousProvider`
+  // is exactly what `isAgentHeterogeneousById` checks, so a second store subscription
+  // would only be redundant binding.
+  const isHeterogeneous = !!agencyConfig?.heterogeneousProvider;
   const currentDeviceId = useElectronStore((s) => s.gatewayDeviceInfo?.deviceId);
   const targetDeviceId = resolveTargetDeviceId(agencyConfig, currentDeviceId);
   // The local machine's filesystem is browsable; a remote device's is not.
@@ -293,7 +313,7 @@ const WorkingDirectoryPicker = memo<WorkingDirectoryPickerProps>(({ agentId }) =
   const { clear, commit } = useCommitWorkingDirectory(agentId);
   const removeDeviceWorkingDir = useDeviceStore((s) => s.removeDeviceWorkingDir);
 
-  const pick = async (entry: { path: string; repoType?: 'git' | 'github' }) => {
+  const pick = async (entry: WorkingDirEntry) => {
     await commit(entry);
     setOpen(false);
   };
@@ -305,6 +325,12 @@ const WorkingDirectoryPicker = memo<WorkingDirectoryPickerProps>(({ agentId }) =
 
   const content = (
     <Flexbox gap={4} style={{ minWidth: 280 }}>
+      {isHeterogeneous && (
+        <Flexbox horizontal align={'flex-start'} className={styles.hint} gap={6}>
+          <Icon icon={InfoIcon} size={14} style={{ flex: 'none', marginTop: 2 }} />
+          <span>{t('workingDirectory.heteroHint')}</span>
+        </Flexbox>
+      )}
       <Flexbox horizontal align={'center'} distribution={'space-between'}>
         <div className={styles.sectionTitle}>{t('workingDirectory.recent')}</div>
         {hasClearableSelection && (
@@ -324,7 +350,7 @@ const WorkingDirectoryPicker = memo<WorkingDirectoryPickerProps>(({ agentId }) =
           </Flexbox>
         ) : (
           recents.map((entry) => {
-            const isActive = entry.path === selectedDir;
+            const isActive = getWorkingDirEffectivePath(entry) === selectedDir;
             return (
               <Flexbox
                 horizontal
