@@ -4,9 +4,10 @@ import { getActivePluginIds } from '@lobechat/types';
 import { Flexbox, Text } from '@lobehub/ui';
 import { Button } from '@lobehub/ui/base-ui';
 import isEqual from 'fast-deep-equal';
-import { memo } from 'react';
+import { memo, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 
+import { useActiveWorkspaceId } from '@/business/client/hooks/useActiveWorkspaceId';
 import SharedAgentTool, { type AgentToolProps } from '@/features/ProfileEditor/AgentTool';
 import PluginTag from '@/features/ProfileEditor/PluginTag';
 import { useAgentStore } from '@/store/agent';
@@ -43,7 +44,26 @@ const UserToolsSection = memo<Props>(
     const { t } = useTranslation('setting');
     const userConnectors = useToolStore(connectorSelectors.connectorList, isEqual);
     const config = useAgentStore(agentSelectors.getAgentConfigById(agentId), isEqual);
-    const userToolCount = getActivePluginIds(config?.plugins).length;
+    // Agent-owned/linked connector identifiers are shown in the Agent Tools
+    // section above (and excluded from this section's chips in `AgentTool`), so
+    // exclude them from the count too — otherwise the header would count a tool
+    // that renders in the section above, not here.
+    const agentConnectors = useToolStore(connectorSelectors.agentConnectors(agentId), isEqual);
+    const agentConnectorIdentifiers = useMemo(
+      () => new Set(agentConnectors.map((c) => c.identifier)),
+      [agentConnectors],
+    );
+    const userToolCount = getActivePluginIds(config?.plugins).filter(
+      (id) => !agentConnectorIdentifiers.has(id),
+    ).length;
+    // In a workspace, this section's base tools are the WORKSPACE dimension
+    // (`connector.list` is workspace-scoped), not the caller's personal tools —
+    // label it so the user knows the tools are shared workspace-scoped, not
+    // their private ones. Personal mode keeps the "User Tools" label.
+    const activeWorkspaceId = useActiveWorkspaceId();
+    const baseToolsLabel = activeWorkspaceId
+      ? t('settingAgent.agentTools.tabWorkspace')
+      : t('settingAgent.agentTools.tabUser');
 
     // Copyable = the user's own base connectors (not agent-owned, not mounted).
     const copyable = userConnectors.filter((c) => !c.agentId && !c.metadata?.mountedByAgentId);
@@ -93,9 +113,14 @@ const UserToolsSection = memo<Props>(
     return (
       <Flexbox gap={8}>
         <Text style={{ fontSize: 12, fontWeight: 500 }} type={'secondary'}>
-          {t('settingAgent.agentTools.tabUser')} · {userToolCount}
+          {baseToolsLabel} · {userToolCount}
         </Text>
-        <SharedAgentTool {...toolProps} agentId={agentId} />
+        <SharedAgentTool
+          {...toolProps}
+          excludeAgentConnectors
+          agentId={agentId}
+          showAuthor={!!activeWorkspaceId}
+        />
       </Flexbox>
     );
   },

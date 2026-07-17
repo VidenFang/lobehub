@@ -22,7 +22,7 @@ import { HeteroTraceRecorder } from './HeteroTraceRecorder';
 
 const log = debug('lobe-server:hetero-agent-service');
 
-export type HeterogeneousAgentType = 'claude-code' | 'codex';
+export type HeterogeneousAgentType = 'amp' | 'claude-code' | 'codex';
 
 export type HeterogeneousFinishResult = 'success' | 'error' | 'cancelled';
 
@@ -39,7 +39,12 @@ export interface HeterogeneousIngestParams {
 
 export interface HeterogeneousFinishParams {
   agentType: HeterogeneousAgentType;
-  error?: { message: string; type: string };
+  /**
+   * CLI-reported failure. `body`, when present, is the structured status-guide
+   * error (`agentType` + `code` + details) persisted verbatim as the
+   * `ChatMessageError.body`.
+   */
+  error?: { body?: Record<string, unknown>; message: string; type: string };
   operationId: string;
   result: HeterogeneousFinishResult;
   /**
@@ -69,7 +74,7 @@ export interface HeterogeneousAgentServiceOptions {
 
 /**
  * Server-side ingest handler for heterogeneous agent CLIs (`lh hetero exec`
- * for Claude Code / Codex). Receives `AgentStreamEvent` batches from the
+ * for Amp / Claude Code / Codex). Receives `AgentStreamEvent` batches from the
  * producer and republishes them through the existing `StreamEventManager`
  * fanout, so renderer-side gateway WS subscribers see the same wire shape
  * regardless of whether the run came from the agent gateway or a CLI process.
@@ -184,7 +189,11 @@ export class HeterogeneousAgentService {
     // accumulated content / reasoning that the in-stream `agent_runtime_end`
     // already wrote (no-op when state is clean), persists the CLI's native
     // session id for next-turn resume, and frees the per-operation memory.
-    await this.persistenceHandler.finish({ error, operationId, result, sessionId });
+    // `topicId` lets finish() bootstrap state for a run that failed before
+    // producing any stream event (spawn ENOENT / auth-on-stderr): the terminal
+    // error must be written HERE, before the `agent_runtime_end` publish below
+    // triggers the client's message refetch.
+    await this.persistenceHandler.finish({ error, operationId, result, sessionId, topicId });
 
     // Always emit a terminal `agent_runtime_end` so renderer subscribers shut
     // down even if the CLI stream missed it (process killed mid-flight,

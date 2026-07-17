@@ -31,10 +31,33 @@ Finish unless the user explicitly asks to keep the environment running.
 Confirm what will run and whether the environment is ready before changing or
 starting anything.
 
-### Step 0 — Read the two living logs (mandatory, before every run)
+Skill-internal setup — loading this skill, reading the living logs and
+reference files — is silent preparation: never narrate it to the user ("I'll
+load the mandatory living logs first…" is noise). The first user-visible
+message of a session is about the user's test — the target confirmation
+(Step 0) or the Phase 1 approval gate — in one message, not a setup
+announcement followed by the same question again.
 
-Before doing anything else, read both of these in full and hold them in mind for
-this run:
+### Step 0 — Ground the target, then read the two living logs (mandatory)
+
+**A test target must exist before anything else happens.** When the invocation
+carries none (bare skill invocation, no pending ask in the conversation),
+ground it first — do NOT read the living logs or touch the environment yet:
+
+1. Take the target from the user's words in this conversation when they
+   exist — the task lives in their words, not in git (common-mistakes Case 3).
+2. Otherwise, infer the most likely candidate from observable context (current
+   branch, recent commits, working-tree changes) and confirm it with one
+   structured question — the candidate as the recommended option, clearly
+   labeled as a guess. Never start executing against an unconfirmed guess.
+3. Only when nothing is inferable, ask one direct open question. Asking "what
+   should I verify" is the one legitimate opening question (common-mistakes
+   Case 8) — but asking it open-ended when a candidate was inferable wastes
+   the user's turn.
+
+**Once the target is known**, read both of these in full and hold them in mind
+for this run. Reading them before a target exists wastes context that may be
+compacted away before Execute — they inform execution, not target selection:
 
 - [references/common-mistakes.md](./references/common-mistakes.md) — mistakes the
   user has called out. Two that keep biting:
@@ -346,6 +369,8 @@ At the end of Step 2, always send one user-facing Plan feedback before entering
 Execute. Read and follow [references/plan.md](./references/plan.md). It requires:
 
 - an overall environment verdict with concrete checks and evidence;
+- emoji-prefixed status markers in the verdict and every table row
+  (`✅ Ready`, `⚠️ Warning`, `❌ Blocked`, `⏳ Pending`);
 - the proposed execution plan, cases, and expected evidence;
 - every unresolved prerequisite, clearly assigned to Codex or the user;
 - an explicit statement that nothing is needed from the user when that is true;
@@ -451,7 +476,8 @@ All under `.agents/skills/agent-testing/scripts/`:
 | `agent-browser-klm.mjs`         | Wrap `agent-browser`, run the real action, and append a GOMS-KLM interaction atom JSONL     |
 | `agent-browser-klm-analyze.mjs` | Summarize interaction JSONL into `result.json.interactionCost` / markdown cost output       |
 | `record-gif.sh`                 | Frame-sequence → GIF for time-based behavior (streaming, timers, animations)                |
-| `report-init.sh`                | Scaffold a structured test report (Step 5)                                                  |
+| `report-init.sh`                | Scaffold a structured test report, grouped by acceptance subject (Step 5)                   |
+| `fixture.mjs`                   | Per-check fixture assets: `init-check` / `list` / `compose` an ingest-ready round (Step 5)  |
 | `check-screen-recording.sh`     | Preflight: OS screen-capture works (macOS Screen Recording + display awake)                 |
 | `electron-dev.sh`               | Manage Electron dev env (start/stop/status/restart, CDP 9222)                               |
 | `cdp-screenshot.sh`             | Electron/Chrome screenshot via RAW CDP (bypasses agent-browser daemon); `--check` preflight |
@@ -506,16 +532,42 @@ Every automated test session ends with a structured, evidence-backed report —
 not a chat-only summary. Scaffold it up front and fill it as you test:
 
 ```bash
-DIR=$(./.agents/skills/agent-testing/scripts/report-init.sh my-feature "Verify my feature")
+# --subject = the acceptance this run belongs to (Step 6) — pass it up front
+DIR=$(./.agents/skills/agent-testing/scripts/report-init.sh --subject topic:tpc_xxx my-feature "Verify my feature")
 # ... test, saving screenshots / CLI transcripts into $DIR/assets/ ...
 # fill $DIR/result.json (scenario, context, cases[], summary.conclusion) — the report;
 # $DIR/report.md holds only the narrative tail (follow-ups / notes / score)
 ```
 
-Reports live in `.records/reports/<timestamp>-<slug>/` (gitignored): `result.json`
-(the structured report — scenario/context/cases/summary), `report.md` (narrative
-tail), `assets/` (evidence). Format spec and evidence rules:
-[references/report.md](./references/report.md).
+Reports live in `.records/reports/<subject-key>/<timestamp>-<slug>/` (gitignored),
+**grouped by acceptance**: one dir per subject (`topic-tpc_xxx`, with an
+`acceptance.json` marker), one subdir per verification run. Each run dir holds
+`result.json` (the structured report — scenario/context/cases/summary),
+`report.md` (narrative tail), `assets/` (evidence). `--subject` also pre-fills
+`result.json.subject` so ingest attaches the run automatically. Format spec and
+evidence rules: [references/report.md](./references/report.md).
+
+#### Fixtures: reusable per-check assets
+
+When a run needs seeded/constructed data (fixture rounds, seed files, probe
+steps), keep those assets per CHECK ITEM — the business check that recurs
+across rounds — under `.records/fixtures/<subject-key>/<check-id>/`
+(`check.json` = plan fragment + case template + future replay `steps`;
+`seed/` = reusable INPUT assets only). The reusability line is inputs vs
+outputs: what a run consumes (files to upload, DB seed fragments, stand-in
+evidence for synthetic ingest rounds) belongs in `seed/`; what a run produces
+(screenshots, transcripts) is tied to that one execution and stays in the round
+dir's `assets/` — never copy it back into the fixture. Compose an ingest-ready
+round from checks instead of hand-writing result.json each time:
+
+```bash
+F=./.agents/skills/agent-testing/scripts/fixture.mjs
+$F init-check --subject topic:tpc_xxx palette-long-list # scaffold, then fill check.json
+$F list --subject topic:tpc_xxx
+DIR=$($F compose --subject topic:tpc_xxx --slug round4 --title "第四轮全量回归" \
+  palette-open palette-long-list)  # → report group round dir
+lh verify ingest-report "$DIR" ... # fixture rounds are normal reports
+```
 
 Two hard rules worth front-loading:
 
@@ -589,37 +641,125 @@ env -u LOBEHUB_SERVER -u LOBE_API_KEY -u LOBEHUB_CLI_API_KEY -u LOBEHUB_CLI_HOME
 env -u LOBEHUB_SERVER -u LOBE_API_KEY -u LOBEHUB_CLI_API_KEY -u LOBEHUB_CLI_HOME lh login                  # only if not authed
 ```
 
-`verify ingest-report` reads `$DIR` and, in one call, creates a standalone
-verification session and uploads everything:
+`verify ingest-report` reads `$DIR` and, in one call, creates a new immutable
+verification run, attaches it to the subject acceptance, and uploads everything:
 
-- `result.json.cases[]` → one check result each (verdict + key observation)
+- `result.json.plan[]` → the frozen check plan (what this round set out to verify),
+  with a business-scenario `category` on every item; categories name requirements
+  or features, never execution surfaces such as Desktop / CLI / Backend
+- `result.json.cases[]` → one check result each (verdict + key observation),
+  paired back to its plan item by `id`; a planned item with no case renders as
+  **未执行** instead of silently disappearing
 - each case's `evidence` file(s) → uploaded to storage and attached to that result
 - `report.md` → the session's full report body, plus the `summary` stats
+
+Two links are attached for you, no flags needed: the branch's **pull request**
+(asked of `gh`) and — when the harness is running inside a LobeHub-spawned agent
+— the **conversation that produced the report**, read from the `LOBEHUB_TOPIC_ID`
+/ `LOBEHUB_AGENT_ID` / `LOBEHUB_OPERATION_ID` the runtime echoes into the child
+env. The origin conversation is shown to the report's author only, never to
+someone holding the shared link.
 
 It prints the `verifyRunId` and, with `--open`, the in-app path
 `/verify/<verifyRunId>` — the report viewer (verdict, stats, every check, and the
 inline screenshot/text evidence). On production that resolves to
-`https://app.lobehub.com/verify/<verifyRunId>`. **Include that full production
-link in the final chat reply** alongside the local report dir.
+`https://app.lobehub.com/verify/<verifyRunId>`.
 
-#### Re-verifying the same case updates the report in place (don't spawn a new one)
+**The final chat reply leads with the ACCEPTANCE link, not the verify link.**
+`https://app.lobehub.com/acceptance/<acceptanceId>` is the stable cross-round
+page where the user reviews the LATEST merged state and closes the loop; a
+`/verify/<id>` report is one round's immutable snapshot — supporting detail.
+Phrase the deliverable as "在 acceptance 页查看最新验收状态" with the acceptance
+URL first; the round's verify link may follow as the per-round record.
 
-When you iterate on one change — fix → re-verify → fix again — **keep reusing the
-same report dir (`$DIR`)**. `ingest-report` records the session it created in a
-`.verify-run.json` sidecar inside `$DIR`, so re-ingesting the **same dir**
-**updates that session in place** (same `/verify/<id>` URL) instead of creating a
-new list entry every round. The update is a full replace: cases are overwritten
-by their stable `id`, each case's evidence is re-attached (old screenshots
-cleared, not stacked), and cases the new report dropped are pruned.
+#### Every run belongs to a subject acceptance (mandatory)
 
-So the rule for an iterative case: `report-init.sh` **once**, then re-run
-`ingest-report "$DIR"` after each fix — the report accretes value at one stable
-URL rather than flooding the list with near-duplicate runs. Only scaffold a fresh
-`$DIR` when you start verifying a genuinely different case.
+Every agent-testing run MUST be chained onto a task, topic, or document
+**acceptance aggregate**, so every round lands on one auditable decision page.
+When the harness runs inside a LobeHub topic, `ingest-report` automatically uses
+`LOBEHUB_TOPIC_ID` as `topic:<id>`; do not ask the user to supply it and do not
+omit the acceptance. An explicit `--subject` or `result.json.subject` overrides
+that default for task/document verification:
 
-Escape hatches: `--new` forces a fresh session even if the dir already made one;
-`--run <verifyRunId>` targets an existing session explicitly (e.g. to update from
-a different machine/checkout where the sidecar is absent).
+```bash
+# SUBJECT is task:$TASK_ID, topic:$TOPIC_ID, or document:$DOC_ID
+env -u LOBEHUB_SERVER -u LOBE_API_KEY -u LOBEHUB_CLI_API_KEY -u LOBEHUB_CLI_HOME \
+  lh verify ingest-report "$DIR" --source agent-testing --subject "$SUBJECT" --open --json
+```
+
+`--subject` accepts `task:<id> | topic:<id> | document:<id>` (or put
+`"subject": "task:<id>"` / `{ "type", "id", "requirement" }` in `result.json`).
+Outside a LobeHub topic, one of those explicit forms is required; publishing
+without a resolvable subject fails instead of creating an orphan verify report.
+
+**Always supply the acceptance `requirement` (验收目标) with the subject** —
+the object form `{ "type", "id", "requirement": "<one-sentence goal>" }` or
+`--requirement`. It is NOT auto-generated: an aggregate created without one
+renders "尚未记录该对象的验收目标" at the top of the decision page. Write it as
+the one-sentence business goal the whole acceptance is judged against (not this
+round's scope). A recorded requirement is immutable; an empty one is backfilled
+by the first later round that supplies it.
+The first ingest creates the acceptance and every ingest creates its next
+immutable round. The user closes the loop on `/acceptance/<acceptanceId>` (also
+printed by `--open`) — accept / reject with a comment; inspect or decide from the
+terminal via `lh verify acceptance view|accept|reject <id | type:id>`.
+
+#### Before the next round: read the acceptance state and the user's feedback (mandatory)
+
+When a follow-up round starts on a subject that already has an acceptance
+(repair after a reject, another iteration on the same PR/topic), the FIRST step
+of planning is reading the prior state — never re-derive it from memory:
+
+```bash
+env -u LOBEHUB_SERVER -u LOBE_API_KEY -u LOBEHUB_CLI_API_KEY -u LOBEHUB_CLI_HOME \
+  lh verify acceptance view "$SUBJECT" --json # or the acceptance uuid
+```
+
+Read three things from the bundle:
+
+- `checks[].state` + `checks[].id` — which checks passed / failed / never ran,
+  and the stable ids the next plan MUST reuse (or `supersedes`).
+- `checks[].userReview` — the user's own verdict on each check:
+  - `action: "accept"` — the user has signed this check off. It stays settled
+    across rounds; keep its stable id in the plan (carry it forward or re-run
+    it cheaply), but it needs no repair work.
+  - `action: "reject", stale: false` — **actionable feedback**: this check is
+    what the next round exists to fix. Read `comment` and every
+    `annotations[].comment` (region notes circled on the evidence screenshots)
+    and address them explicitly; the round's fix summary should reference them.
+  - `stale: true` — feedback already consumed by a newer round; it is history.
+- `checks[].reviews` — the full feedback trail (for context on how a check
+  evolved).
+
+The human-readable `view` (without `--json`) prints the same signal: a `C#`
+label and a USER column per check, plus a `user feedback` section with
+`▶ actionable` / `· addressed` markers. After the new round is ingested, the
+addressed feedback automatically moves into the check's iteration history on
+the acceptance page — do not delete or restate it anywhere.
+
+**The next round touches ONLY what is not user-settled.** Rounds are immutable
+snapshots, but the union view is where "overwriting" happens — through ids:
+
+- `userReview.action == "accept"` → user-settled. Do NOT re-run it, do NOT
+  restate it in the new plan; the union carries it forward untouched.
+- a check being fixed or re-verified → reuse its EXACT stable id, so the new
+  result lands on the same union row (same `C#`) as a new timeline step.
+- a check whose semantics changed → new id with `supersedes: ['old-id']`.
+- NEVER give the same semantic assertion a fresh id without `supersedes`: the
+  union has no fuzzy matching, so it renders as a pile of new parallel rows
+  next to the old ones instead of an iteration.
+
+#### Every verification run is an immutable snapshot
+
+One call to `ingest-report` creates one immutable `/verify/<id>` snapshot. Never
+overwrite, replace, prune, or re-ingest into an earlier run. A fix followed by
+re-verification MUST create another run on the same acceptance, preserving the
+earlier plan, results, evidence, and verdict exactly as observed at that time.
+
+Use a fresh report directory for every execution round. The acceptance page is
+the stable cross-round URL; individual `/verify/<id>` URLs are permanent
+historical records. There is no `--run` update path and no same-directory
+sidecar reuse in the agent-testing workflow.
 
 Notes:
 

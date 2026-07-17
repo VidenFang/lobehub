@@ -7,30 +7,49 @@ user (or a reviewer, or a later agent) audits without replaying the session.
 ## Location & layout
 
 Reports live under `.records/reports/` (gitignored, like all `.records/`
-output):
+output), **grouped by the acceptance they belong to**: one directory per
+subject, one subdirectory per verification run (round). The subject key is the
+ingest subject with `:` → `-`.
 
 ```
-.records/reports/<YYYYMMDD-HHMMSS>-<slug>/
-├── report.md      # narrative TAIL only (跟进 / 本轮验证 / 评分) — rendered as the page's "Details"
-├── result.json    # the structured source: scenario + context + cases + summary.conclusion
-└── assets/        # evidence: screenshots, HAR files, CLI transcripts
+.records/reports/<subject-key>/                  # e.g. topic-tpc_acceptreview001
+├── acceptance.json                              # group marker: subject, title, lastRun
+├── <YYYYMMDD-HHMMSS>-<slug>/                    # one run = one round on the acceptance
+│   ├── report.md      # narrative TAIL only (跟进 / 本轮验证 / 评分) — the page's "Details"
+│   ├── result.json    # the structured source: scenario + context + cases + summary.conclusion
+│   └── assets/        # evidence: screenshots, HAR files, CLI transcripts
+└── <YYYYMMDD-HHMMSS>-<slug>/                    # the next round, and so on
 ```
+
+Every run belongs to a subject acceptance (SKILL.md Step 6), so the group is
+known before the round starts — pass it to the scaffold:
+`report-init.sh --subject topic:tpc_xxx <slug> "<title>"`. The scaffold also
+pre-fills `result.json.subject`, so `lh verify ingest-report` attaches the run
+without an explicit `--subject`. Runs scaffolded without `--subject` fall back
+to a flat `.records/reports/<ts>-<slug>/` (legacy layout, still readable by
+`ingest-report` — but new runs should always carry their subject).
+
+Reusable per-check fixture assets live NEXT to the report groups under
+`.records/fixtures/<subject-key>/<check-id>/` — `check.json` plus `seed/`
+(INPUTS a run consumes: files to upload, DB seed fragments, replay steps'
+material). Execution OUTPUTS (screenshots, transcripts) are per-run evidence
+and belong only in the round dir's `assets/`. See `scripts/fixture.mjs` and
+SKILL.md "Fixtures: reusable per-check assets".
 
 **`result.json` is the report — `report.md` is just its tail.** The published
-verify page (`/verify/<id>`) renders itself from `result.json`: the scope header
-from `scenario` + `context` (branch / commit / surfaces / entry / focus), the
-per-check table from `cases[]`, the overall conclusion from `summary.conclusion`
-(shown at the top under the scope block), and the stats from `summary`. So
-`report.md` must NOT repeat the scope block or a 用例 table — those double up on
-the page. It carries only the non-duplicate narrative (仍需跟进 / 本轮验证 /
-评分), rendered as the page's collapsible "Details".
+verify page (`/verify/<id>`) renders itself from `result.json`: one line of
+provenance (PR / branch / commit / date / surfaces), the overall conclusion from
+`summary.conclusion` directly under the title, and the check list from `plan[]`
+paired with `cases[]`. So `report.md` must NOT repeat the scope block or a 用例
+table — those double up on the page. It carries only the non-duplicate narrative
+(仍需跟进 / 本轮验证 / 评分), rendered as the page's collapsible "Details".
 
 ## Workflow
 
 1. **Scaffold up front** — before running the first test step:
 
    ```bash
-   DIR=$(./.agents/skills/agent-testing/scripts/report-init.sh < slug > "<title>")
+   DIR=$(./.agents/skills/agent-testing/scripts/report-init.sh --subject topic:tpc_xxx < slug > "<title>")
    ```
 
    The script creates the directory, pre-fills branch / commit / date in both
@@ -63,7 +82,14 @@ the page. It carries only the non-duplicate narrative (仍需跟进 / 本轮验�
 
    - UI (before/after comparison): capture and visually verify both original
      screenshots. Do not ask the agent to compose them into a new image. In the
-     case's `evidence` array, pair them with a shared comparison id:
+     case's `evidence` array, pair them with a shared comparison id.
+
+     **A `comparison` pair means ONE view in two states** — the same surface
+     before and after a change (the red/green role bands say "was / is now").
+     Two sequential steps of a FLOW (a dialog, then the state after submitting
+     it) are NOT a before/after: labeling them so misstates the semantics and
+     reads as if the first shot were a defect. For flow steps, attach plain
+     ordered evidence items and let each caption name its step:
 
      ```json
      "evidence": [
@@ -110,21 +136,32 @@ the page. It carries only the non-duplicate narrative (仍需跟进 / 本轮验�
 
    - Network: `agent-browser network requests` dumps or HAR files.
 
-3. **Fill `result.json` as you go** — it is the report. Each tested behavior is
+3. **Write `plan[]` BEFORE you run anything.** The approved plan from Step 1 is
+   part of the report, not scaffolding you throw away: each item is
+   `{ id, title, verifier, method, expected, requiredEvidence }` — what you will
+   check, how it is judged, how you will exercise it, what would make it pass,
+   and the artifact it must produce. `verifier` and `requiredEvidence` are closed
+   sets the pipeline acts on (see the schema below); `method` / `expected` are
+   prose. `cases[]` later reuses the same `id`s, which is what lets the report
+   pair intent against outcome. A planned item that never produces a case renders
+   as **未执行** rather than vanishing, so cut coverage in the open — silently
+   dropping a check now shows up as a hole in the report.
+
+4. **Fill `result.json` as you go** — it is the report. Each tested behavior is
    one entry in `cases[]` (`{ id, name, result, observation, evidence }`), where
    `evidence` is a path under `assets/` (screenshot / GIF / transcript). Set the
-   scope fields (`scenario: "coding"`, `branch`, `commit`, `surfaces`, `entry`,
-   `focus`) and write the one-paragraph verdict into `summary.conclusion`. The
-   page pairs each check with its evidence inline, so you don't hand-build a
-   table. `report.md` holds only the narrative tail (跟进 / 本轮验证 / 评分).
+   scope fields (`scenario: "coding"`, `branch`, `commit`, `surfaces`, `entry`)
+   and write the one-paragraph verdict into `summary.conclusion`. The page pairs
+   each check with its evidence inline, so you don't hand-build a table.
+   `report.md` holds only the narrative tail (跟进 / 本轮验证 / 评分).
 
-4. **Set the verdict** in both `report.md` and `result.json`, then link the
+5. **Set the verdict** in both `report.md` and `result.json`, then link the
    report directory in your final answer to the user. If UI evidence exists,
    list the key screenshot/GIF links in the final chat response. Use Markdown
    link text as the evidence caption, for example:
    `[Image #1 - observed outcome](<report-dir>/assets/case1.png)`.
 
-5. **Publish to LobeHub** (Step 4 of the skill) — upload the finished session so
+6. **Publish to LobeHub** (Step 4 of the skill) — upload the finished session so
    it's viewable in-app, not just on disk. **Publish to PRODUCTION
    (`app.lobehub.com`) with the user's real login, NOT the local dev CLI** —
    strip the local dev overrides so `lh` uses its production defaults:
@@ -134,9 +171,9 @@ the page. It carries only the non-duplicate narrative (仍需跟进 / 本轮验�
      lh verify ingest-report "$DIR" --source agent-testing --open --json
    ```
 
-   This creates a standalone verification session and uploads the cases (as check
-   results), each case's `evidence` files, and `report.md` (as the report body),
-   then prints `/verify/<verifyRunId>` (→ `https://app.lobehub.com/verify/<id>`).
+   This creates a new immutable verification run, attaches it to the required
+   subject acceptance, uploads the cases, evidence, and report body, then prints
+   both `/verify/<verifyRunId>` and `/acceptance/<acceptanceId>`.
    Include that full production link in the final reply alongside the local
    report dir. See SKILL.md → Step 4 for why production (a localhost URL isn't
    shareable and a local stub S3 fails file-evidence uploads), the production
@@ -215,11 +252,23 @@ missing; a blocked case is not a pass).
 
 ## result.json schema
 
+**Two fields are the report's identity in every list surface — treat them as
+REQUIRED on every ingest:**
+
+- `title` (top level) — without it the run lists as "未命名验证" forever.
+- `summary.verdict` (`pass` / `fail` / `partial`) — without it the list glyph is
+  a permanent amber "?" instead of the green pass. The CLI now derives a
+  fallback from the cases, but an explicit verdict is still the author's job.
+- Every `comparison` pair side should carry a `label` — the role band renders
+  it as the explanation ("优化前：清单头部被挤压…"); a pair without labels shows
+  two bare role words and reads as unexplained.
+
 ```json
 {
   "branch": "feat/task-tree",
   "cases": [
     {
+      "category": "Task hierarchy",
       "id": "1",
       "name": "task tree returns nested children",
       "surface": "cli",
@@ -239,6 +288,21 @@ missing; a blocked case is not a pass).
     "operators": { "K": 1, "P": 2, "H": 0, "M": 2, "T_chars": 5, "R_ms": 2000 },
     "phases": []
   },
+  "plan": [
+    {
+      "id": "1",
+      "title": "task tree returns nested children",
+      "verifier": "program",
+      "method": "lh task list --tree against a 3-level fixture",
+      "expected": "root shows 3 nested children at depth 2",
+      "requiredEvidence": ["text"]
+    }
+  ],
+  "pullRequest": {
+    "number": 17152,
+    "title": "feat(task): nested task tree",
+    "url": "https://github.com/lobehub/lobe-chat/pull/17152"
+  },
   "summary": {
     "total": 1,
     "passed": 1,
@@ -252,9 +316,65 @@ missing; a blocked case is not a pass).
 }
 ```
 
+`plan[]` is the checks you committed to **before running them**, and it shares
+`id`s with `cases[]`. Every agent-testing plan item must carry a `category` that
+names its user-facing business scenario or requirement area (for example `Task
+hierarchy`, `Rate-limit recovery`, or `Browser actions`). It must not name a
+technical surface such as `Desktop`, `CLI`, or `Backend`: Acceptance groups are
+organized by what the user is accepting, while `surface` separately records
+where the check ran. A plan item with no matching case renders as **未执行**:
+cutting coverage is allowed, hiding that you cut it is not.
+
+Two of its fields are a **closed vocabulary**, because the pipeline acts on them
+— they are not labels:
+
+| field              | values                                                                       | what it does                                                                                                               |
+| ------------------ | ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `verifier`         | `program` \| `agent` \| `llm` (default `agent`)                              | How the verdict is reached. A command-asserted check is `program`; calling it `agent` hides what actually judged it.       |
+| `requiredEvidence` | `screenshot` \| `gif` \| `video` \| `text` \| `dom_snapshot` \| `transcript` | The artifact this check **must** produce. The executor's coverage gate **fails** an item whose required medium is missing. |
+
+An out-of-vocabulary value in either fails the ingest — an unrecognized medium
+would silently gate on nothing, which is worse than no gate at all.
+
+`method` (how you would exercise it) and `expected` (what would make it pass)
+stay **free prose** — they carry intent no enum can, and both render under the
+check on the page next to the outcome.
+
+A plan item may also carry a per-item `surface` (same closed set as the run-level
+`surfaces` below; `electron` normalizes to `desktop`). It says which product
+surface THIS check ran on. It is metadata, never an Acceptance grouping key. An
+unknown value is warned about and dropped, never stored.
+
+`surfaces` is a **closed set** — `web` | `desktop` | `cli` | `mobile` | `bot` —
+and names the product surface a check ran **on**. `electron` is accepted and
+normalized to `desktop`. Anything else fails the ingest, so don't reach for it:
+
+- A **test kind** is not a surface. `unit`, `backend`, `database`, `type-check`
+  do not belong here; a backend change verified through the CLI has surface
+  `cli`.
+- A **runtime mode** is not a surface. "packaged build (app.isPackaged=true)",
+  "CDP dev instance" — that detail belongs on the plan item's `method`.
+
+`entry` is the command or URL exercised (`lh task list --tree`,
+`/chat/settings`) — **not** a PR title and not a description of the change.
+
+`pullRequest` is optional: when it is absent, the ingest asks `gh` for the PR of
+`branch` and fills it in. Write it explicitly only when the report verifies a PR
+that isn't the branch's own.
+
 `score` is optional — use it when the verdict has a subjective component (UI
 polish, copy quality); omit it for purely binary runs. `verdict` is the single
 word the user reads first: `pass`, `fail`, or `partial`.
+
+`subject` identifies the business subject whose **acceptance aggregate** owns
+this immutable run: either
+`"subject": "task:<id>"` (`task` | `topic` | `document`) or
+`{ "type": "task", "id": "task_…", "requirement": "one-sentence acceptance bar" }`.
+The `--subject` flag overrides this field. Inside a LobeHub conversation, both
+may be omitted because `ingest-report` defaults to
+`topic:$LOBEHUB_TOPIC_ID`; outside a topic, an explicit subject is mandatory.
+Every ingest creates a new immutable run. Never update a prior run after a fix;
+publish the re-verification as the next round on the same acceptance.
 
 `interactionCost` is optional and run-level. For UI runs driven through
 `agent-browser`, create `interaction-trace.jsonl` with

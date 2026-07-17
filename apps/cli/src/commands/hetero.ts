@@ -15,14 +15,19 @@ import type {
   AgentStreamEvent,
   UploadHeterogeneousImage,
 } from '@lobechat/heterogeneous-agents/spawn';
-import { createFileStoreImageUploader, spawnAgent } from '@lobechat/heterogeneous-agents/spawn';
+import {
+  classifyHeteroProcessFailure,
+  createFileStoreImageUploader,
+  isHeteroStatusGuideErrorData,
+  spawnAgent,
+} from '@lobechat/heterogeneous-agents/spawn';
 import type { Command } from 'commander';
 
 import { getTrpcClient } from '../api/client';
 import { log } from '../utils/logger';
 import { TrpcIngestSink } from '../utils/TrpcIngestSink';
 
-const SUPPORTED_AGENT_TYPES = new Set(['claude-code', 'codex']);
+const SUPPORTED_AGENT_TYPES = new Set(['amp', 'claude-code', 'codex']);
 const CODEX_REASONING_EFFORT_CONFIG_KEY = 'model_reasoning_effort';
 const CODEX_SERVICE_TIER_CONFIG_KEY = 'service_tier';
 
@@ -107,18 +112,20 @@ const buildExtraArgs = (
   options: Pick<ExecOptions, 'agentArg' | 'effort' | 'model' | 'speed' | 'type'>,
 ): string[] | undefined => {
   const selectorArgs =
-    options.type === 'codex'
-      ? [
-          ...(options.model ? ['--model', options.model] : []),
-          ...(options.effort
-            ? ['-c', `${CODEX_REASONING_EFFORT_CONFIG_KEY}="${options.effort}"`]
-            : []),
-          ...(options.speed ? ['-c', `${CODEX_SERVICE_TIER_CONFIG_KEY}="${options.speed}"`] : []),
-        ]
-      : [
-          ...(options.model ? ['--model', options.model] : []),
-          ...(options.effort ? ['--effort', options.effort] : []),
-        ];
+    options.type === 'amp'
+      ? []
+      : options.type === 'codex'
+        ? [
+            ...(options.model ? ['--model', options.model] : []),
+            ...(options.effort
+              ? ['-c', `${CODEX_REASONING_EFFORT_CONFIG_KEY}="${options.effort}"`]
+              : []),
+            ...(options.speed ? ['-c', `${CODEX_SERVICE_TIER_CONFIG_KEY}="${options.speed}"`] : []),
+          ]
+        : [
+            ...(options.model ? ['--model', options.model] : []),
+            ...(options.effort ? ['--effort', options.effort] : []),
+          ];
   const extraArgs = [...(options.agentArg ?? []), ...selectorArgs];
 
   return extraArgs.length > 0 ? extraArgs : undefined;
@@ -474,7 +481,7 @@ const exec = async (options: ExecOptions): Promise<void> => {
   // Build the ingest sink — no-op for standalone mode, real tRPC sink for
   // server-ingest mode.  The tRPC client reads LOBEHUB_JWT (operation-scoped
   // JWT injected by the server) for authentication.
-  const agentType = options.type as 'claude-code' | 'codex';
+  const agentType = options.type as 'amp' | 'claude-code' | 'codex';
   let sink: TrpcIngestSink | undefined;
   let serverIngester: SerialServerIngester | undefined;
   // Uploader for tool_result images (CC `Read` on an image file). Reuses the
@@ -595,6 +602,31 @@ const exec = async (options: ExecOptions): Promise<void> => {
   }
 
   /**
+   * Build the `finish` error payload. Process-level failures the agent CLI
+   * never got to report in-stream (spawn ENOENT because the CLI isn't
+   * installed, an auth failure printed straight to stderr) are classified into
+   * the structured status-guide shape and attached as `body`, so the client
+   * renders the dedicated install/sign-in guide instead of the generic error
+   * card. Unclassifiable failures keep the flat `{ message, type }` everything
+   * downstream already handles.
+   *
+   * A classified error is always typed `AgentRuntimeError` — matching how the
+   * adapters' in-stream classified errors (overloaded / rate_limit) persist —
+   * instead of leaking the transport-internal `type` the failure happened to
+   * surface through (`stream_error` for a spawn ENOENT reads wrong on a
+   * "CLI not installed" error).
+   */
+  const buildFinishError = (
+    message: string,
+    type: string,
+    errnoCode?: string,
+  ): { body?: Record<string, unknown>; message: string; type: string } => {
+    const classified = classifyHeteroProcessFailure({ agentType, detail: message, errnoCode });
+    if (!classified) return { message, type };
+    return { body: { ...classified }, message: classified.message, type: 'AgentRuntimeError' };
+  };
+
+  /**
    * Spawn one agent process and stream all its events into the server ingester.
    *
    * When `interceptResumeErrors` is true, any `error`-type event whose
@@ -614,6 +646,12 @@ const exec = async (options: ExecOptions): Promise<void> => {
    *                      and still exit 0, so the exit code alone is not enough)
    *   terminalErrorMessage — the message from that terminal `error` event, used
    *                      as the task-level error detail in the finish payload
+   *   terminalErrorData — the full structured payload of that terminal `error`
+   *                      event when the adapter already classified it into a
+   *                      status-guide error (overloaded / rate_limit / …); the
+   *                      finish leg forwards it verbatim as the error `body` so
+   *                      the client renders the dedicated guide instead of the
+   *                      generic error card
    *   stderrContent  — accumulated stderr (only when interceptResumeErrors=true)
    */
   const runOneAgent = async (
@@ -628,6 +666,7 @@ const exec = async (options: ExecOptions): Promise<void> => {
     sessionId: string | undefined;
     signal: NodeJS.Signals | null;
     stderrContent: string;
+    terminalErrorData: Record<string, unknown> | undefined;
     terminalErrorMessage: string | undefined;
   }> => {
     // One raw-dump file pair per spawn attempt (the resume retry is a second
@@ -647,7 +686,7 @@ const exec = async (options: ExecOptions): Promise<void> => {
         try {
           await serverIngester.drain();
           await sink.finish({
-            error: { message, type: 'AgentRuntimeError' },
+            error: buildFinishError(message, 'AgentRuntimeError'),
             result: 'error',
           });
         } catch {
@@ -719,6 +758,7 @@ const exec = async (options: ExecOptions): Promise<void> => {
     let resumeNotFound = false;
     let sawTerminalError = false;
     let terminalErrorMessage: string | undefined;
+    let terminalErrorData: Record<string, unknown> | undefined;
     const ingestError = false;
     try {
       for await (const event of handle.events) {
@@ -742,6 +782,11 @@ const exec = async (options: ExecOptions): Promise<void> => {
           sawTerminalError = true;
           const data = event.data as Record<string, unknown> | undefined;
           terminalErrorMessage = String(data?.message ?? data?.error ?? '') || undefined;
+          // Keep the adapter's already-classified status-guide payload
+          // (overloaded / rate_limit carry `agentType` + `code`) so the finish
+          // leg doesn't flatten it back to a bare string — the process-failure
+          // classifier there only knows cli_not_found / auth_required.
+          terminalErrorData = isHeteroStatusGuideErrorData(data) ? data : undefined;
         }
         if (emitJsonl) process.stdout.write(`${JSON.stringify(event)}\n`);
         serverIngester?.push(event);
@@ -754,8 +799,16 @@ const exec = async (options: ExecOptions): Promise<void> => {
       if (serverIngester && sink) {
         try {
           await serverIngester.drain();
+          // A spawn failure (missing CLI binary / cwd) surfaces HERE, not via
+          // `exit`: `spawnAgent` fails the event stream on the child's `error`
+          // event, so this catch runs and exits before the finish block below.
+          // Pass the raw errno code along for precise classification.
           await sink.finish({
-            error: { message: String(err), type: 'stream_error' },
+            error: buildFinishError(
+              String(err),
+              'stream_error',
+              (err as NodeJS.ErrnoException | null)?.code,
+            ),
             result: 'error',
           });
         } catch {
@@ -792,6 +845,7 @@ const exec = async (options: ExecOptions): Promise<void> => {
       sessionId: handle.sessionId,
       signal,
       stderrContent,
+      terminalErrorData,
       terminalErrorMessage,
     };
   };
@@ -805,7 +859,7 @@ const exec = async (options: ExecOptions): Promise<void> => {
     ...(askMcpConfigPath ? ['--mcp-config', askMcpConfigPath] : []),
   ];
   // Resolve the CLI binary once, up front, and reuse it for both the initial
-  // run and the resume-retry. For the default bare command (`codex`/`claude`)
+  // run and the resume-retry. For the default bare command (`amp`/`codex`/`claude`)
   // this finds the validated binary — including an app-bundled Codex CLI when
   // a broken `codex` shim shadows PATH — so sandbox/terminal runs no longer
   // ENOENT on a stale global install. Custom commands are used verbatim.
@@ -890,10 +944,22 @@ const exec = async (options: ExecOptions): Promise<void> => {
     // payload small.
     const stderrTail = result.stderrContent.trim();
     const errorDetail = result.terminalErrorMessage || stderrTail;
-    const finishError =
-      !exitedClean && errorDetail
-        ? { message: errorDetail.slice(-1024), type: 'AgentRuntimeError' }
-        : undefined;
+    // The adapter's in-stream classification (overloaded / rate_limit) already
+    // carries the structured status-guide body — forward it verbatim instead of
+    // re-deriving from the flattened message via the process-only classifier,
+    // which would drop `agentType`/`code` and demote the client UI to the
+    // generic error card.
+    const finishError = exitedClean
+      ? undefined
+      : result.terminalErrorData
+        ? {
+            body: { ...result.terminalErrorData },
+            message: String(result.terminalErrorData.message ?? errorDetail ?? ''),
+            type: 'AgentRuntimeError',
+          }
+        : errorDetail
+          ? buildFinishError(errorDetail.slice(-1024), 'AgentRuntimeError')
+          : undefined;
 
     try {
       await sink.finish({
@@ -926,7 +992,9 @@ const exec = async (options: ExecOptions): Promise<void> => {
 export function registerHeteroCommand(program: Command) {
   const hetero = program
     .command('hetero')
-    .description('Run heterogeneous agent CLIs (Claude Code / Codex) and stream their output');
+    .description(
+      'Run heterogeneous agent CLIs (Amp / Claude Code / Codex) and stream their output',
+    );
 
   hetero
     .command('exec')
@@ -959,7 +1027,7 @@ export function registerHeteroCommand(program: Command) {
     )
     .option(
       '-c, --command <bin>',
-      'Override the agent CLI binary name (default: `claude` or `codex`)',
+      'Override the agent CLI binary name (default: `amp`, `claude`, or `codex`)',
     )
     .option(
       '--operation-id <id>',

@@ -76,7 +76,17 @@ describe('buildWorkspaceAwarePath', () => {
     expect(buildWorkspaceAwarePath('/settings/audit-log', 'acme')).toBe('/acme/settings/audit-log');
     expect(buildWorkspaceAwarePath('/settings/storage', 'acme')).toBe('/acme/settings/storage');
     expect(buildWorkspaceAwarePath('/settings/messenger', 'acme')).toBe('/acme/settings/messenger');
+    expect(buildWorkspaceAwarePath('/settings/credential', 'acme')).toBe(
+      '/acme/settings/credential',
+    );
+    // Legacy alias — prefixed, then the router redirects to `credential`.
     expect(buildWorkspaceAwarePath('/settings/creds', 'acme')).toBe('/acme/settings/creds');
+    expect(buildWorkspaceAwarePath('/settings/oauth-apps', 'acme')).toBe(
+      '/acme/settings/oauth-apps',
+    );
+    expect(buildWorkspaceAwarePath('/settings/oauth-apps/client-1', 'acme')).toBe(
+      '/acme/settings/oauth-apps/client-1',
+    );
     expect(buildWorkspaceAwarePath('/settings/provider/openai', 'acme')).toBe(
       '/acme/settings/provider/openai',
     );

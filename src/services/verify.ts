@@ -1,4 +1,6 @@
 import type {
+  AcceptanceCheckReviewAction,
+  AcceptanceReviewAnnotation,
   VerifierType,
   VerifyCheckItem,
   VerifyEvidence,
@@ -16,6 +18,11 @@ import type {
   VerifyRunItem,
 } from '@/database/schemas/verify';
 import { lambdaClient } from '@/libs/trpc/client';
+
+export type AcceptanceBundle = Awaited<ReturnType<typeof lambdaClient.acceptance.getBundle.query>>;
+export type AcceptanceListItem = Awaited<
+  ReturnType<typeof lambdaClient.acceptance.list.query>
+>[number];
 
 /** Editable fields of a single delivery-check criterion. */
 export interface UpdateCriterionValue {
@@ -80,6 +87,12 @@ export type VerifyResultWithEvidence = VerifyCheckResultItem & {
 
 /** Everything the standalone report viewer needs for one verification session. */
 export interface VerifyReportBundle {
+  /**
+   * Whether the viewer authored this run. Report URLs are public, so
+   * author-only affordances (the origin conversation) gate on this — the server
+   * redacts `run.metadata.origin` for everyone else.
+   */
+  isOwner: boolean;
   report: VerifyReport | null;
   results: VerifyResultWithEvidence[];
   run: VerifyRunItem;
@@ -124,6 +137,38 @@ export interface GenerateDraftPlanInput {
 
 /** Client wrapper around the `verify` lambda router. */
 export class VerifyService {
+  // ---- subject-level acceptance ----
+  getAcceptanceBundle = (id: string): Promise<AcceptanceBundle> =>
+    lambdaClient.acceptance.getBundle.query({ id });
+
+  listAcceptances = (): Promise<AcceptanceListItem[]> => lambdaClient.acceptance.list.query();
+
+  acceptDelivery = (id: string, comment?: string) =>
+    lambdaClient.acceptance.accept.mutate({ comment, id });
+
+  rejectDelivery = (id: string, comment: string) =>
+    lambdaClient.acceptance.reject.mutate({ comment, id });
+
+  /**
+   * The user's verdict on individual union checks — accept settles a check for
+   * good; reject records feedback the next round reads. A group "accept all"
+   * is the same call with many ids.
+   */
+  reviewChecks = (input: {
+    action: AcceptanceCheckReviewAction;
+    annotations?: AcceptanceReviewAnnotation[];
+    checkItemIds: string[];
+    comment?: string;
+    id: string;
+  }) => lambdaClient.acceptance.reviewChecks.mutate(input);
+
+  /**
+   * Feedback addressed to a check group (business category) — for concerns
+   * that belong to no single check yet must reach the next round.
+   */
+  addGroupFeedback = (input: { category: string; comment: string; id: string }) =>
+    lambdaClient.acceptance.addGroupFeedback.mutate(input);
+
   // ---- per-run plan ----
   getVerifyState = (operationId: string): Promise<VerifyStateResponse | null> =>
     lambdaClient.verify.getVerifyState.query({

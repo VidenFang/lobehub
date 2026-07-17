@@ -31,6 +31,7 @@ import Files from './Files';
 import ProgressSection from './ProgressSection';
 import ResourcesSection from './ResourcesSection';
 import Review from './Review';
+import WorksSection from './WorksSection';
 
 const ParamsSection = lazy(() => import('./ParamsSection'));
 const BrowserPane = lazy(() => import('./Browser'));
@@ -91,18 +92,24 @@ const TWO_PANE_MIN_WIDTH = 560;
 
 const AgentWorkingSidebar = memo(() => {
   const { t } = useTranslation(['chat', 'setting']);
-  const [storedWidth, updateSystemStatus, toggleRightPanel, setWorkingSidebarTab, showRightPanel, storedTab] =
-    useGlobalStore((s) => [
-      systemStatusSelectors.workingSidebarWidth(s),
-      s.updateSystemStatus,
-      s.toggleRightPanel,
-      s.setWorkingSidebarTab,
-      // Panel open/collapsed state (drives the `<RightPanel>` expand). Used to gate
-      // the resources pane's document fetch so a collapsed sidebar doesn't pull the
-      // full agent-document list into the conversation's initial batch.
-      s.status.showRightPanel,
-      s.status.workingSidebarTab,
-    ]);
+  const [
+    storedWidth,
+    updateSystemStatus,
+    toggleRightPanel,
+    setWorkingSidebarTab,
+    showRightPanel,
+    storedTab,
+  ] = useGlobalStore((s) => [
+    systemStatusSelectors.workingSidebarWidth(s),
+    s.updateSystemStatus,
+    s.toggleRightPanel,
+    s.setWorkingSidebarTab,
+    // Panel open/collapsed state (drives the `<RightPanel>` expand). Used to gate
+    // the resources pane's document fetch so a collapsed sidebar doesn't pull the
+    // full agent-document list into the conversation's initial batch.
+    s.status.showRightPanel,
+    s.status.workingSidebarTab,
+  ]);
   const activeAgentId = useAgentStore((s) => s.activeAgentId);
   const topicId = useChatStore((s) => s.activeTopicId);
   const isLocalSystemEnabled = useAgentStore((s) =>
@@ -152,16 +159,24 @@ const AgentWorkingSidebar = memo(() => {
   const reviewAvailable =
     (isLocalSystemEnabled || isDeviceMode) && !!workingDirectory && !!repoType;
   const paramsAvailable = !isHetero;
-  // The in-app browser rides on the Electron <webview> tag — desktop only,
+  // The in-app browser pages are main-process WebContentsViews — desktop only,
   // and gated behind the Labs toggle while the feature matures.
   const enableInAppBrowser = useUserStore(labPreferSelectors.enableInAppBrowser);
   const browserAvailable = isDesktop && enableInAppBrowser;
-  const browserSessionId = `agent:${activeAgentId ?? 'default'}`;
+  // Must mint the same key the browser tools do (`sessionIdOf` in
+  // builtin-tool-browser), or the user and the agent would be looking at two
+  // different pages. A draft topic has no id yet, but the panel is openable
+  // there (user types a URL before sending anything), so it borrows a per-agent
+  // key until the topic materializes.
+  const browserSessionId = topicId
+    ? `topic:${topicId}`
+    : `draft-agent:${activeAgentId ?? 'default'}`;
 
   const businessTabs = useBusinessWorkingSidebarTabs({ activeAgentId, topicId });
 
   const availableTabs = new Set<string>([
     'resources',
+    'works',
     ...(reviewAvailable ? ['review'] : []),
     ...(filesAvailable ? ['files'] : []),
     ...(browserAvailable ? ['browser'] : []),
@@ -244,6 +259,13 @@ const AgentWorkingSidebar = memo(() => {
               onClick={() => setWorkingSidebarTab('resources')}
             >
               {t('workingPanel.space')}
+            </button>
+            <button
+              className={`${styles.tab} ${activeTab === 'works' ? styles.tabActive : ''}`}
+              type="button"
+              onClick={() => setWorkingSidebarTab('works')}
+            >
+              {t('workingPanel.works.title')}
             </button>
             {reviewAvailable && (
               <button
@@ -336,6 +358,9 @@ const AgentWorkingSidebar = memo(() => {
               deviceId={remoteDeviceId}
               enabled={showRightPanel && activeTab === 'resources'}
             />
+          </Flexbox>
+          <Flexbox className={activeTab === 'works' ? styles.pane : styles.paneHidden}>
+            <WorksSection active={showRightPanel && activeTab === 'works'} />
           </Flexbox>
         </Flexbox>
       </Flexbox>

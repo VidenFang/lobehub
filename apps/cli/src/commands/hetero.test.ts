@@ -102,8 +102,9 @@ describe('hetero exec command', () => {
     stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
     mockResolveHeteroSpawnCommand.mockReset();
     mockResolveHeteroSpawnCommand.mockImplementation(
-      async (agentType: 'claude-code' | 'codex', command?: string) => ({
-        command: command ?? (agentType === 'codex' ? 'codex' : 'claude'),
+      async (agentType: 'amp' | 'claude-code' | 'codex', command?: string) => ({
+        command:
+          command ?? (agentType === 'amp' ? 'amp' : agentType === 'codex' ? 'codex' : 'claude'),
       }),
     );
     mockSpawnAgent.mockReset();
@@ -321,6 +322,34 @@ describe('hetero exec command', () => {
     });
   });
 
+  it('runs AMP and forwards only native agent args', async () => {
+    mockSpawnAgent.mockReturnValue(createFakeHandle());
+
+    await runCmd([
+      'hetero',
+      'exec',
+      '--type',
+      'amp',
+      '--prompt',
+      'do thing',
+      '--model',
+      'ignored-by-wrapper',
+      '--effort',
+      'high',
+      '--agent-arg=--mode',
+      '--agent-arg=high',
+    ]);
+
+    expect(mockResolveHeteroSpawnCommand).toHaveBeenCalledWith('amp', undefined);
+    expect(mockSpawnAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentType: 'amp',
+        command: 'amp',
+        extraArgs: ['--mode', 'high'],
+      }),
+    );
+  });
+
   it('streams events to stdout as JSONL, one line per event', async () => {
     const events = [
       { data: { foo: 1 }, operationId: 'op-1', stepIndex: 0, timestamp: 1, type: 'stream_start' },
@@ -508,7 +537,7 @@ describe('hetero exec command', () => {
   });
 
   it('finishes server-ingest runs with error when spawnAgent rejects before streaming', async () => {
-    mockSpawnAgent.mockRejectedValue(new Error('spawn claude ENOENT'));
+    mockSpawnAgent.mockRejectedValue(new Error('image fetch failed: 404'));
 
     await runCmd([
       'hetero',
@@ -528,17 +557,18 @@ describe('hetero exec command', () => {
     expect(mockHeteroFinishMutate).toHaveBeenCalledTimes(1);
     expect(mockHeteroFinishMutate.mock.calls[0][0]).toMatchObject({
       agentType: 'claude-code',
-      error: { message: 'spawn claude ENOENT', type: 'AgentRuntimeError' },
+      error: { message: 'image fetch failed: 404', type: 'AgentRuntimeError' },
       operationId: 'op-server',
       result: 'error',
       topicId: 'topic-1',
     });
+    expect(mockHeteroFinishMutate.mock.calls[0][0].error.body).toBeUndefined();
     expect(exitSpy).toHaveBeenCalledWith(1);
   });
 
   it('finishes server-ingest runs with error when the agent event stream fails', async () => {
     mockSpawnAgent.mockReturnValue(
-      createFakeHandle({ eventsError: new Error('spawn claude ENOENT') }),
+      createFakeHandle({ eventsError: new Error('adapter choked on malformed JSONL') }),
     );
 
     await runCmd([
@@ -558,7 +588,89 @@ describe('hetero exec command', () => {
 
     expect(mockHeteroFinishMutate).toHaveBeenCalledTimes(1);
     expect(mockHeteroFinishMutate.mock.calls[0][0]).toMatchObject({
-      error: { message: 'Error: spawn claude ENOENT', type: 'stream_error' },
+      error: { message: 'Error: adapter choked on malformed JSONL', type: 'stream_error' },
+      operationId: 'op-server',
+      result: 'error',
+      topicId: 'topic-1',
+    });
+    expect(mockHeteroFinishMutate.mock.calls[0][0].error.body).toBeUndefined();
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it('classifies a spawn ENOENT stream failure as a structured cli_not_found error', async () => {
+    // `spawnAgent` surfaces a missing CLI binary by failing the event stream
+    // with the child's ErrnoException (see `failStream` in spawnAgent.ts).
+    const enoent = new Error('spawn claude ENOENT') as NodeJS.ErrnoException;
+    enoent.code = 'ENOENT';
+    mockSpawnAgent.mockReturnValue(createFakeHandle({ eventsError: enoent }));
+
+    await runCmd([
+      'hetero',
+      'exec',
+      '--type',
+      'claude-code',
+      '--prompt',
+      'hi',
+      '--topic',
+      'topic-1',
+      '--operation-id',
+      'op-server',
+      '--render',
+      'none',
+    ]);
+
+    expect(mockHeteroFinishMutate).toHaveBeenCalledTimes(1);
+    expect(mockHeteroFinishMutate.mock.calls[0][0]).toMatchObject({
+      error: {
+        body: {
+          agentType: 'claude-code',
+          code: 'cli_not_found',
+          stderr: 'Error: spawn claude ENOENT',
+        },
+        // Classified errors are normalized to AgentRuntimeError — the
+        // transport-internal `stream_error` label must not leak into the
+        // persisted error type.
+        type: 'AgentRuntimeError',
+      },
+      operationId: 'op-server',
+      result: 'error',
+      topicId: 'topic-1',
+    });
+    expect(mockHeteroFinishMutate.mock.calls[0][0].error.message).toContain('was not found');
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it('classifies an auth failure on stderr as a structured auth_required error', async () => {
+    // CLI exits non-zero after printing an auth error to stderr, without ever
+    // emitting a structured error event.
+    mockSpawnAgent.mockReturnValue(
+      createFakeHandle({
+        exitCode: 1,
+        stderrChunks: ['Error: not authenticated. Run `claude login` first.\n'],
+      }),
+    );
+
+    await runCmd([
+      'hetero',
+      'exec',
+      '--type',
+      'claude-code',
+      '--prompt',
+      'hi',
+      '--topic',
+      'topic-1',
+      '--operation-id',
+      'op-server',
+      '--render',
+      'none',
+    ]);
+
+    expect(mockHeteroFinishMutate).toHaveBeenCalledTimes(1);
+    expect(mockHeteroFinishMutate.mock.calls[0][0]).toMatchObject({
+      error: {
+        body: { agentType: 'claude-code', code: 'auth_required' },
+        type: 'AgentRuntimeError',
+      },
       operationId: 'op-server',
       result: 'error',
       topicId: 'topic-1',
@@ -906,6 +1018,66 @@ describe('hetero exec command', () => {
     expect(mockHeteroFinishMutate.mock.calls[0][0]).toMatchObject({
       error: {
         message: 'API Error: Server is temporarily limiting requests · Rate limited',
+        type: 'AgentRuntimeError',
+      },
+      result: 'error',
+    });
+  });
+
+  it('forwards the adapter-classified status-guide error as the finish error body', async () => {
+    // The adapter classifies overloaded / rate-limit terminal errors into a
+    // structured payload carrying `agentType` + `code` — the pair the client's
+    // status-guide UI gates on. The finish leg must forward it verbatim instead
+    // of flattening to `{ message }`, otherwise flushFinalState overwrites the
+    // in-stream persisted error and the client falls back to the generic alert.
+    const overloadedMessage =
+      'API Error: 529 Overloaded. This is a server-side issue, usually temporary.';
+    mockSpawnAgent.mockReturnValue(
+      createFakeHandle({
+        events: [
+          {
+            data: {
+              agentType: 'claude-code',
+              clearEchoedContent: true,
+              code: 'overloaded',
+              error: overloadedMessage,
+              message: overloadedMessage,
+              stderr: overloadedMessage,
+            },
+            operationId: 'op-err-guide',
+            stepIndex: 0,
+            timestamp: 1,
+            type: 'error',
+          },
+        ],
+        exitCode: 0,
+      }),
+    );
+
+    await runCmd([
+      'hetero',
+      'exec',
+      '--type',
+      'claude-code',
+      '--prompt',
+      'hi',
+      '--topic',
+      'topic-1',
+      '--operation-id',
+      'op-err-guide',
+      '--render',
+      'none',
+    ]);
+
+    expect(mockHeteroFinishMutate).toHaveBeenCalledTimes(1);
+    expect(mockHeteroFinishMutate.mock.calls[0][0]).toMatchObject({
+      error: {
+        body: {
+          agentType: 'claude-code',
+          code: 'overloaded',
+          message: overloadedMessage,
+        },
+        message: overloadedMessage,
         type: 'AgentRuntimeError',
       },
       result: 'error',
