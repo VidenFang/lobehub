@@ -134,12 +134,6 @@ export const topicKeys = {
   ]),
 };
 
-// ---- fleet (Observation Mode board) -------------------------------------
-export const fleetKeys = {
-  /** Account-wide set of actively-running topics powering the Observation board. */
-  runningTopics: def('fleet:runningTopics', () => ['fleet:runningTopics']),
-};
-
 // ---- agent --------------------------------------------------------------
 export const agentKeys = {
   /** Sidebar agent list. */
@@ -514,6 +508,8 @@ export const evalKeys = {
   datasetDetail: def('eval:datasetDetail', (id: string) => ['eval:datasetDetail', id]),
   datasetRuns: def('eval:datasetRuns', (datasetId: string) => ['eval:datasetRuns', datasetId]),
   datasets: def('eval:datasets', (benchmarkId: string) => ['eval:datasets', benchmarkId]),
+  experimentDetail: def('eval:experimentDetail', (id: string) => ['eval:experimentDetail', id]),
+  experiments: def('eval:experiments', () => ['eval:experiments']),
   runDetail: def('eval:runDetail', (id: string) => ['eval:runDetail', id]),
   runResults: def('eval:runResults', (id: string) => ['eval:runResults', id]),
   runs: def('eval:runs', (benchmarkId?: string) => ['eval:runs', benchmarkId]),
@@ -1053,7 +1049,6 @@ export const swrKeys = {
   eval: evalKeys,
   favorite: favoriteKeys,
   file: fileKeys,
-  fleet: fleetKeys,
   fork: forkKeys,
   gateway: gatewayKeys,
   global: globalKeys,

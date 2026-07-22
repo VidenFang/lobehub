@@ -14,9 +14,8 @@ import {
 import { memo, useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import { message } from '@/components/AntdStaticMethods';
-import Action from '@/features/ChatInput/ActionBar/components/Action';
 import { type ActionDropdownMenuItems } from '@/features/ChatInput/ActionBar/components/ActionDropdown';
+import { ChatInputAction } from '@/features/ChatInput/ActionBar/components/ChatInputAction';
 import { useChatInputStore } from '@/features/ChatInput/store';
 import { useConversationStore } from '@/features/Conversation';
 import { useGoalArmStore } from '@/features/Conversation/ChatInput/VerifyTray/goalArmStore';
@@ -116,8 +115,9 @@ const HeteroPlus = memo(() => {
                 if (topicId) {
                   void openTopicGoalModal(topicId);
                 } else if (agentId) {
+                  // Arm only — the persistent "armed" chip above the composer is
+                  // the feedback now (the next message becomes the goal).
                   useGoalArmStore.getState().arm(agentId);
-                  message.success(tVerify('acceptance.tray.goalArmed'));
                 }
               },
             },
@@ -138,7 +138,7 @@ const HeteroPlus = memo(() => {
   ]);
 
   return (
-    <Action
+    <ChatInputAction
       icon={PlusIcon}
       open={open}
       size={{ blockSize: 32, borderRadius: 16, size: 18 }}
