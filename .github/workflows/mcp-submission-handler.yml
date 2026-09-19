@@ -1,5 +1,5 @@
 name: MCP Submission Handler
-# Auto-close "Add my MCP server to the marketplace" issues and redirect to the self-service CLI
+# Auto-close MCP marketplace listing / rescan issues and redirect to the self-service CLI
 
 on:
   issues:
@@ -26,7 +26,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup environment
         uses: ./.github/actions/setup-env

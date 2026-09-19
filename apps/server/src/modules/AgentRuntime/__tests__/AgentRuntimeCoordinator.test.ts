@@ -28,7 +28,11 @@ describe('AgentRuntimeCoordinator', () => {
       getExecutionHistory: vi.fn(),
       getOperationMetadata: vi.fn(),
       getStats: vi.fn(),
+      isInterrupted: vi.fn(),
       loadAgentState: vi.fn(),
+      markInterrupted: vi.fn(),
+      hasQueuedMessages: vi.fn(),
+      setQueuedMessages: vi.fn(),
       saveAgentState: vi.fn(),
       saveStepResult: vi.fn(),
     };

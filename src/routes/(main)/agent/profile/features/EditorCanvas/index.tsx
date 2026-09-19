@@ -3,8 +3,8 @@
 import type { IEditor } from '@lobehub/editor';
 import { ReactMentionPlugin, ReactTablePlugin, ReactToolbarPlugin } from '@lobehub/editor';
 import { Editor } from '@lobehub/editor/react';
-import { ActionIcon, Flexbox } from '@lobehub/ui';
-import { toast } from '@lobehub/ui/base-ui';
+import { Flexbox } from '@lobehub/ui';
+import { ActionIcon, toast } from '@lobehub/ui/base-ui';
 import { createStaticStyles, cssVar } from 'antd-style';
 import isEqual from 'fast-deep-equal';
 import { CodeXmlIcon, LetterTextIcon } from 'lucide-react';
@@ -452,7 +452,6 @@ const AgentEditorCanvas = memo<AgentEditorCanvasProps>(({ agentId }) => {
               // bubbled click, and Lexical's focus() moves the caret to the
               // document end when there is no selection — scrolling the page to
               // the bottom. Toggling the view mode must not move the caret.
-              // See LOBE-12593.
               onClick={(e) => e.stopPropagation()}
             >
               <ActionIcon

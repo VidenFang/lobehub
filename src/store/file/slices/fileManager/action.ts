@@ -4,7 +4,7 @@ import {
   sanitizeFolderName,
   topologicalSortFolders,
 } from '@lobechat/utils';
-import { toast } from '@lobehub/ui/base-ui';
+import { toast, type ToastInstance } from '@lobehub/ui/base-ui';
 import { t } from 'i18next';
 import pMap from 'p-map';
 import { type SWRResponse } from 'swr';
@@ -163,6 +163,51 @@ export class FileManageActionImpl {
     });
   };
 
+  retryDockUpload = async (id: string): Promise<void> => {
+    const { dispatchDockFileList, dockUploadFileList } = this.#get();
+    const item = dockUploadFileList.find((file) => file.id === id);
+    if (!item || item.status !== 'error' || item.errorCode) return;
+
+    const abortController = new AbortController();
+    dispatchDockFileList({
+      id,
+      type: 'updateFile',
+      value: {
+        abortController,
+        error: undefined,
+        errorCode: undefined,
+        status: 'pending',
+        uploadState: undefined,
+      },
+    });
+
+    try {
+      const result = await this.#get().uploadWithProgress({
+        abortController,
+        file: item.file,
+        knowledgeBaseId: item.knowledgeBaseId,
+        onStatusUpdate: dispatchDockFileList,
+        parentId: item.parentId,
+        uploadId: id,
+        visibility: item.visibility,
+      });
+
+      if (!result) return;
+      await this.#get().refreshFileList({ revalidateResources: true });
+
+      if (!isChunkingUnsupported(item.file.type)) {
+        await this.#get().parseFilesToChunks([result.id], { skipExist: false });
+      }
+    } catch (error) {
+      console.error(error);
+      dispatchDockFileList({
+        id,
+        type: 'updateFile',
+        value: { error: t('upload.uploadFailed', { ns: 'error' }), status: 'error' },
+      });
+    }
+  };
+
   dispatchDockFileList = (payload: UploadFileListDispatch): void => {
     const nextValue = uploadFileListReducer(this.#get().dockUploadFileList, payload);
     if (nextValue === this.#get().dockUploadFileList) return;
@@ -198,6 +243,7 @@ export class FileManageActionImpl {
     try {
       const response = await serverFileService.getKnowledgeItems({
         ...queryListParams,
+        includeContentPreview: queryListParams.includeContentPreview ?? false,
         limit: queryListParams.limit ?? 50,
         offset: fileListOffset,
       });
@@ -299,7 +345,10 @@ export class FileManageActionImpl {
         abortController,
         file,
         id: `upload_${generateUploadId()}`,
+        knowledgeBaseId,
+        parentId,
         status: 'pending' as const,
+        visibility,
       };
     });
 
@@ -478,10 +527,6 @@ export class FileManageActionImpl {
     this.#set({ pendingRenameItemId: id }, false, 'setPendingRenameItemId');
   };
 
-  setUploadDockExpanded = (expanded: boolean): void => {
-    this.#set({ uploadDockExpanded: expanded }, false, 'setUploadDockExpanded');
-  };
-
   toggleEmbeddingIds = (ids: string[], loading?: boolean): void => {
     this.#set((state) => {
       const nextValue = new Set(state.creatingEmbeddingTaskIds);
@@ -533,10 +578,13 @@ export class FileManageActionImpl {
     const sortedFolderPaths = topologicalSortFolders(folders);
 
     // Show toast notification if there are folders to create
-    const loadingToast =
-      sortedFolderPaths.length > 0
-        ? toast.loading(t('header.actions.uploadFolder.creatingFolders', { ns: 'file' }))
-        : undefined;
+    let creatingFoldersToast: ToastInstance | undefined;
+    if (sortedFolderPaths.length > 0) {
+      creatingFoldersToast = toast.loading({
+        duration: Infinity, // Don't auto-dismiss
+        title: t('header.actions.uploadFolder.creatingFolders', { ns: 'file' }),
+      });
+    }
 
     try {
       // Map to store created folder IDs: relative path -> folder ID
@@ -589,7 +637,7 @@ export class FileManageActionImpl {
       }
 
       // Dismiss the toast after folders are created
-      loadingToast?.close();
+      creatingFoldersToast?.close();
 
       // Refresh file list to show the new folders
       await this.#get().refreshFileList();
@@ -625,10 +673,12 @@ export class FileManageActionImpl {
       // 7. Add all files to dock
       dispatchDockFileList({
         atStart: true,
-        files: uploadItems.map(({ abortController, file, id }) => ({
+        files: uploadItems.map(({ abortController, file, id, parentId }) => ({
           abortController,
           file,
           id,
+          knowledgeBaseId,
+          parentId,
           status: 'pending' as const,
         })),
         type: 'addFiles',
@@ -691,7 +741,7 @@ export class FileManageActionImpl {
       }
     } catch (error) {
       // Dismiss toast on error
-      loadingToast?.close();
+      creatingFoldersToast?.close();
       throw error;
     }
   };
@@ -720,6 +770,7 @@ export class FileManageActionImpl {
     return useClientDataSWR<FileListItem[]>(fileKeys.knowledgeItems(params), async () => {
       const response = await serverFileService.getKnowledgeItems({
         ...params,
+        includeContentPreview: params.includeContentPreview ?? false,
         limit: params.limit ?? 50,
         offset: 0,
       });

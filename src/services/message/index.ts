@@ -2,7 +2,6 @@ import {
   type ChatMessageError,
   type ChatMessagePluginError,
   type ChatTranslate,
-  type ChatTTS,
   type CreateMessageParams,
   type CreateMessageResult,
   type HeterogeneousToolStateSnapshot,
@@ -34,6 +33,8 @@ export interface MessageQueryContext {
 
 interface MessageReadQueryContext {
   agentId?: string | null;
+  /** Agent-share visitor surface — routes the read through `shareChat.getMessages`. */
+  agentShareId?: string;
   groupId?: string | null;
   /**
    * Skip the Work-summary assembly on the server — set by mid-stream
@@ -146,6 +147,22 @@ export class MessageService {
   };
 
   getMessages = async (params: MessageReadQueryContext): Promise<UIChatMessage[]> => {
+    // Agent-share visitor surface: the owner-scoped query below resolves rows in
+    // the CALLER's scope, so it would come back empty for a visitor (share rows
+    // belong to the creator). Route through the share-authorized read instead.
+    // A share context without a topic is the visitor's new-topic bucket —
+    // nothing to fetch.
+    if (params.agentShareId) {
+      if (!params.topicId) return [];
+
+      const shared = await lambdaClient.shareChat.getMessages.query({
+        shareId: params.agentShareId,
+        topicId: params.topicId,
+      });
+
+      return shared as unknown as UIChatMessage[];
+    }
+
     // Opt into `file` (and any future gated) work summaries in the message
     // payload. This client ships the descriptor fallback; clients that predate
     // the `file` type run the old service without the flag and stay on the
@@ -167,6 +184,7 @@ export class MessageService {
   };
 
   countMessages = async (params?: {
+    approximate?: boolean;
     endDate?: string;
     range?: [string, string];
     startDate?: string;
@@ -241,10 +259,6 @@ export class MessageService {
 
   updateMessageTranslate = async (id: string, translate: Partial<ChatTranslate> | false) => {
     return lambdaClient.message.updateTranslate.mutate({ id, value: translate as ChatTranslate });
-  };
-
-  updateMessageTTS = async (id: string, tts: Partial<ChatTTS> | false) => {
-    return lambdaClient.message.updateTTS.mutate({ id, value: tts });
   };
 
   updateMessageMetadata = async (
