@@ -1060,8 +1060,6 @@ export class AgentRuntimeService {
       const initialState = {
         activatedStepTools,
         createdAt: new Date().toISOString(),
-        enableExpertise,
-        expertise,
         // Store initialContext for executeSync to use
         initialContext,
         lastModified: new Date().toISOString(),
@@ -1115,13 +1113,14 @@ export class AgentRuntimeService {
         // modelRuntimeConfig at state level for executor fallback
         modelRuntimeConfig,
         operationId,
+        // The run's only copy of its tool set. The manifest map is the heaviest
+        // thing on the state and the state is re-serialized at every step, so the
+        // former top-level mirrors (`tools`, `toolManifestMap`, `toolSourceMap`,
+        // `toolExecutorMap`) are no longer written; readers go through
+        // `selectToolManifestMap` and friends.
         operationToolSet,
         status: 'idle',
         stepCount: initialStepCount,
-        // Backward-compat: resolved tool fields read by RuntimeExecutors
-        toolExecutorMap: operationToolSet.executorMap,
-        toolManifestMap: operationToolSet.manifestMap,
-        toolSourceMap: operationToolSet.sourceMap,
         // How the run executes — frozen from here on.
         plan: {
           eval: evalRuntime,
@@ -1139,8 +1138,19 @@ export class AgentRuntimeService {
             shareVisitor: agentShareVisitor,
           },
           audit: { clientIp: appContext?.clientIp, userAgent: appContext?.userAgent },
-          policy: { deviceAccess: deviceAccessPolicy },
+          // What the run may do, decided once here: device access and the
+          // approval mode its tool calls answer to.
+          policy: { deviceAccess: deviceAccessPolicy, userIntervention: userInterventionConfig },
         },
+        // Compat mirrors for a rolling deploy: a worker still running the
+        // pre-slot build reads only these, and a missing approval mode defaults
+        // to `manual` there — which parks a headless run on an approval nobody
+        // can give. Drop them (and the matching entries in
+        // `normalizeAgentState`'s COMPAT_MIRROR_PATHS) once no pre-slot worker
+        // can pick up a step.
+        enableExpertise,
+        expertise,
+        userInterventionConfig,
         // What the model is told about the run's world — frozen from here on;
         // the context engine reads it on every step.
         world: {
@@ -1150,16 +1160,15 @@ export class AgentRuntimeService {
           }),
           connectorOwnershipNote,
           disabledPluginIds,
+          enableExpertise,
           eval: evalContext,
+          expertise,
           group: agentGroup,
           projectInstructions,
           searchDecision,
           userMemory,
           userTimezone,
         },
-        tools: operationToolSet.tools,
-        // User intervention config for headless mode in async tasks
-        userInterventionConfig,
       } as Partial<AgentState>;
 
       // Use coordinator to create operation, automatically sends initialization event.
@@ -1489,6 +1498,11 @@ export class AgentRuntimeService {
       stepLockOwner,
     );
     if (!claimed) {
+      // Someone else owns this operation now. Whatever this invocation buffered
+      // for the trace belongs to their partial from here — every return below
+      // leaves without it, so drop it once, up front, rather than per exit.
+      this.traceRecorder.discardPartial();
+
       let currentState: AgentState | null | undefined = null;
       try {
         currentState = await this.coordinator.loadAgentState(operationId);
@@ -1647,6 +1661,11 @@ export class AgentRuntimeService {
     // runtime.step() call site stays as the authoritative start for the
     // success path.
     const stepStartAt = Date.now();
+
+    // Hoisted so the shared `finally` knows whether the next step stays in this
+    // invocation. When it does, the accumulated trace partial stays in memory;
+    // on every other exit some other process reads it, so it has to be durable.
+    let handedOffInline = false;
 
     // OTel invoke_agent span. Wraps the entire step body so child spans
     // (chat / execute_tool / context_engineering) auto-nest via the active
@@ -2415,6 +2434,7 @@ export class AgentRuntimeService {
           }
 
           if (parked) {
+            handedOffInline = true;
             // Hand the next step back to the caller instead of paying a full
             // queue round-trip for it. The caller either runs it in this same
             // invocation or publishes it via `scheduleContinuation` when its
@@ -2425,6 +2445,9 @@ export class AgentRuntimeService {
             }));
             log('[%s][%d] Next step %d deferred to caller', operationId, stepIndex, nextStepIndex);
           } else {
+            // The next step runs in another invocation, which rebuilds the
+            // partial from the store — it has to see this step.
+            await this.traceRecorder.flushPartial();
             await this.queueService.scheduleMessage({ ...next, endpoint: `${this.baseURL}/run` });
             nextStepScheduled = true;
             logToolCallPc(operationId, stepIndex, 'post.next_step_scheduled', () => ({
@@ -2663,6 +2686,10 @@ export class AgentRuntimeService {
       stepAbortPollStopped = true;
       if (stepAbortPoll) clearTimeout(stepAbortPoll);
       stopStepLockHeartbeat();
+      // Parked runs (human input, async tools) and finished ones are read back
+      // by a different invocation, so the partial cannot stay in memory only.
+      // An inline hand-off keeps it: the next step runs on this recorder.
+      if (!handedOffInline) await this.traceRecorder.flushPartial();
       // The inline step loop keeps the lock across step boundaries — releasing
       // here would open a window for a stale redelivery to claim it mid-run.
       // Its caller releases once, in a `finally`, for the whole invocation.
@@ -2683,6 +2710,10 @@ export class AgentRuntimeService {
         `Cannot schedule continuation for ${continuation.operationId}: no queue service`,
       );
     }
+
+    // The steps this invocation inlined are still only in memory — the
+    // invocation that picks the run up reads the partial from the store.
+    await this.traceRecorder.flushPartial();
 
     await this.queueService.scheduleMessage({
       ...continuation,
@@ -4276,11 +4307,15 @@ export class AgentRuntimeService {
    * Determine operation completion reason
    */
   private determineCompletionReason(state: AgentState): StepCompletionReason {
-    if (state.status === 'done') return 'done';
     if (state.status === 'error') return 'error';
     if (state.status === 'interrupted') return 'interrupted';
     if (state.status === 'waiting_for_human') return 'waiting_for_human';
     if (state.status === 'waiting_for_async_tool') return 'waiting_for_async_tool';
+    // Checked ahead of 'done' on purpose: a run the repeat guard cut short ends
+    // in exactly that status, having emitted a turn with no tool calls. Reading
+    // it as a plain 'done' is what made these runs uncountable.
+    if (state.toolCallRepeatGuard?.stoppedByRepeatLimit) return 'tool_call_repeat_limit';
+    if (state.status === 'done') return 'done';
     if (state.maxSteps && state.stepCount >= state.maxSteps) return 'max_steps';
     if (state.costLimit && state.cost?.total >= state.costLimit.maxTotalCost) return 'cost_limit';
     return 'done';

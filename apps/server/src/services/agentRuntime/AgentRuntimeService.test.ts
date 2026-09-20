@@ -420,6 +420,63 @@ describe('AgentRuntimeService', () => {
     });
   });
 
+  describe('determineCompletionReason', () => {
+    const reasonFor = (state: Record<string, any>) =>
+      (service as any).determineCompletionReason(state);
+
+    it('should report a plain completion as done', () => {
+      expect(reasonFor({ status: 'done', stepCount: 3 })).toBe('done');
+    });
+
+    // The guard finalizes the turn without tool calls, which is indistinguishable
+    // from a real answer by status alone — so these runs were all filed as 'done'
+    // and could not be counted.
+    it('should name a run the tool-call repeat guard cut short', () => {
+      expect(
+        reasonFor({
+          status: 'done',
+          stepCount: 250,
+          toolCallRepeatGuard: { counts: {}, stoppedByRepeatLimit: true },
+        }),
+      ).toBe('tool_call_repeat_limit');
+    });
+
+    it('should let a real failure outrank the repeat-guard marker', () => {
+      expect(
+        reasonFor({
+          status: 'error',
+          stepCount: 250,
+          toolCallRepeatGuard: { counts: {}, stoppedByRepeatLimit: true },
+        }),
+      ).toBe('error');
+      expect(
+        reasonFor({
+          status: 'interrupted',
+          stepCount: 250,
+          toolCallRepeatGuard: { counts: {}, stoppedByRepeatLimit: true },
+        }),
+      ).toBe('interrupted');
+    });
+
+    it('should ignore a guard that counted repeats without ever stopping', () => {
+      expect(
+        reasonFor({ status: 'done', stepCount: 3, toolCallRepeatGuard: { counts: { sig: 4 } } }),
+      ).toBe('done');
+    });
+
+    it('should still report the step and cost caps', () => {
+      expect(reasonFor({ status: 'running', maxSteps: 10, stepCount: 10 })).toBe('max_steps');
+      expect(
+        reasonFor({
+          status: 'running',
+          stepCount: 3,
+          cost: { total: 5 },
+          costLimit: { maxTotalCost: 5 },
+        }),
+      ).toBe('cost_limit');
+    });
+  });
+
   describe('createOperation', () => {
     const mockParams: OperationCreationParams = {
       operationId: 'test-operation-1',
@@ -470,8 +527,8 @@ describe('AgentRuntimeService', () => {
           stepCount: 0,
           messages: [],
           modelRuntimeConfig: mockParams.modelRuntimeConfig,
+          operationToolSet: expect.objectContaining({ manifestMap: {} }),
           origin: expect.objectContaining({ userId: mockParams.userId }),
-          toolManifestMap: {},
           world: expect.objectContaining({ agent: mockParams.agentConfig }),
         }),
       );
@@ -490,6 +547,42 @@ describe('AgentRuntimeService', () => {
         priority: 'high',
         delay: 50,
       });
+    });
+
+    it('records the approval mode as a run policy', async () => {
+      await service.createOperation({
+        ...mockParams,
+        userInterventionConfig: { approvalMode: 'headless' },
+      });
+
+      const [, state] = mockCoordinator.saveAgentState.mock.calls[0];
+      expect(state.principal.policy.userIntervention).toEqual({ approvalMode: 'headless' });
+      // Mirrored at the top level for the rolling-deploy window: a worker on the
+      // pre-slot build reads only that, and would park this headless run.
+      expect(state.userInterventionConfig).toEqual({ approvalMode: 'headless' });
+    });
+
+    it('stores the run tool set once, on the operation slot', async () => {
+      const manifestMap = { 'lobe-web-browsing': { identifier: 'lobe-web-browsing' } };
+
+      await service.createOperation({
+        ...mockParams,
+        toolSet: {
+          enabledToolIds: ['lobe-web-browsing'],
+          executorMap: {},
+          manifestMap,
+          sourceMap: { 'lobe-web-browsing': 'builtin' },
+          tools: [{ function: { name: 'search' }, type: 'function' }],
+        } as unknown as OperationCreationParams['toolSet'],
+      });
+
+      const [, state] = mockCoordinator.saveAgentState.mock.calls[0];
+      expect(state.operationToolSet.manifestMap).toEqual(manifestMap);
+      // Manifests are the heaviest thing on the state and it is re-serialized at
+      // every step, so the legacy top-level mirrors are not written any more.
+      for (const mirror of ['toolExecutorMap', 'toolManifestMap', 'toolSourceMap', 'tools']) {
+        expect(mirror in state).toBe(false);
+      }
     });
 
     it('keeps the frozen model facts on the run state but out of durable storage', async () => {
@@ -608,11 +701,14 @@ describe('AgentRuntimeService', () => {
         expertise,
       });
 
+      // What the model is told about the run lives on the world slot, with the
+      // top-level mirror kept for pre-slot workers during a rolling deploy.
       expect(mockCoordinator.saveAgentState).toHaveBeenCalledWith(
         'test-operation-1',
         expect.objectContaining({
           enableExpertise: true,
           expertise,
+          world: expect.objectContaining({ enableExpertise: true, expertise }),
         }),
       );
     });

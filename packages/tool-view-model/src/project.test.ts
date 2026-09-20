@@ -1,8 +1,9 @@
+import { LOADING_FLAT } from '@lobechat/const';
 import type { UIChatMessage } from '@lobechat/types';
 import { describe, expect, it, vi } from 'vitest';
 
 import { projectToolViewModels } from './project';
-import { listProjectedTools } from './registry';
+import { getToolProjector, listProjectedTools } from './registry';
 import type { ToolProjector } from './types';
 
 const toolMessage = (partial: Partial<UIChatMessage> = {}): UIChatMessage =>
@@ -21,10 +22,35 @@ const resolveWith = (projector: ToolProjector) => (identifier?: string | null) =
   identifier === 'lobe-web-browsing' ? projector : undefined;
 
 describe('projectToolViewModels', () => {
-  it('leaves every message untouched when no projector matches', () => {
-    const messages = [toolMessage(), toolMessage({ id: 'a', role: 'assistant' })];
+  it('drops the body of a tool with no projector, keeping its state whole', () => {
+    const [projected] = projectToolViewModels([toolMessage()], () => undefined);
 
-    expect(projectToolViewModels(messages, () => undefined)).toEqual(messages);
+    expect(projected.content).toBe('');
+    expect(projected.contentLength).toBe('RAW BODY'.length);
+    expect(projected.payloadOmitted).toBe('render');
+    // State drives the collapsed row and whole-list selectors, which never get
+    // an "expand" to hydrate on.
+    expect(projected.pluginState).toEqual(toolMessage().pluginState);
+  });
+
+  it('leaves a still-streaming row alone — the sentinel IS how it reads as running', () => {
+    // `hasToolResultBody` recognises the placeholder only while it sits in
+    // `content`; projecting it away would report a running tool as finished.
+    const streaming = toolMessage({ content: LOADING_FLAT });
+
+    expect(projectToolViewModels([streaming], () => undefined)[0]).toEqual(streaming);
+  });
+
+  it('does not flag an empty result, which has nothing to fetch back', () => {
+    const empty = toolMessage({ content: '' });
+
+    expect(projectToolViewModels([empty], () => undefined)[0]).toEqual(empty);
+  });
+
+  it('never touches a non-tool message', () => {
+    const assistant = toolMessage({ id: 'a', role: 'assistant' });
+
+    expect(projectToolViewModels([assistant], () => undefined)[0]).toEqual(assistant);
   });
 
   it('keeps the original content length after the body is dropped', () => {
@@ -58,14 +84,14 @@ describe('projectToolViewModels', () => {
     expect(projected.payloadOmitted).toBe('render');
   });
 
-  it('does not mark a message as omitted when the projector declines', () => {
+  it('respects a projector that declines — it knows the shape, the default does not', () => {
     const [projected] = projectToolViewModels(
       [toolMessage()],
       resolveWith(() => undefined),
     );
 
     expect(projected.payloadOmitted).toBeUndefined();
-    expect(projected.pluginState).toEqual(toolMessage().pluginState);
+    expect(projected.content).toBe('RAW BODY');
   });
 
   it('falls back to the stored payload when a projector throws', () => {
@@ -116,12 +142,77 @@ describe('registry', () => {
     expect(listProjectedTools().sort()).toEqual([
       'claude-code/Bash',
       'codex/command_execution',
+      'lobe-agent-documents/listDocuments',
       'lobe-agent-documents/readDocument',
+      'lobe-local-system/readFile',
       'lobe-local-system/runCommand',
+      'lobe-user-memory/searchUserMemory',
       'lobe-web-browsing/crawlMultiPages',
       'lobe-web-browsing/crawlSinglePage',
       'opencode/bash',
       'pi/bash',
     ]);
+  });
+});
+
+describe('listDocumentsProjector', () => {
+  const listMessage = (pluginState: unknown) =>
+    toolMessage({
+      content: 'RAW BODY',
+      plugin: { apiName: 'listDocuments', arguments: '{}', identifier: 'lobe-agent-documents' },
+      pluginState,
+    } as Partial<UIChatMessage>);
+
+  it('keeps the row count the inspector chip prints and drops the rows', () => {
+    const documents = Array.from({ length: 12 }, (_, index) => ({
+      filename: `doc-${index}.md`,
+      id: `d${index}`,
+      title: 'x'.repeat(200),
+    }));
+
+    const [projected] = projectToolViewModels([listMessage({ documents })], getToolProjector);
+
+    expect(projected.pluginState).toEqual({ documentCount: 12 });
+    expect(projected.content).toBe('');
+    expect(projected.payloadOmitted).toBe('render');
+  });
+
+  it('survives a state that never held a list', () => {
+    const [projected] = projectToolViewModels([listMessage({ scope: 'agent' })], getToolProjector);
+
+    expect(projected.pluginState).toEqual({ documentCount: undefined, scope: 'agent' });
+  });
+});
+
+describe('searchUserMemoryProjector', () => {
+  const memoryMessage = (pluginState: unknown) =>
+    toolMessage({
+      content: 'RAW BODY',
+      plugin: { apiName: 'searchUserMemory', arguments: '{}', identifier: 'lobe-user-memory' },
+      pluginState,
+    } as Partial<UIChatMessage>);
+
+  it('reduces the five buckets to the one number the chip shows', () => {
+    const [projected] = projectToolViewModels(
+      [
+        memoryMessage({
+          activities: [{ content: 'x'.repeat(400) }, { content: 'y' }],
+          contexts: [{ content: 'z' }],
+          experiences: [],
+          identities: [{ content: 'a' }],
+          preferences: [],
+        }),
+      ],
+      getToolProjector,
+    );
+
+    expect(projected.pluginState).toEqual({ resultCount: 4 });
+    expect(projected.payloadOmitted).toBe('render');
+  });
+
+  it('reports zero for an empty search rather than dropping the state', () => {
+    const [projected] = projectToolViewModels([memoryMessage({})], getToolProjector);
+
+    expect(projected.pluginState).toEqual({ resultCount: 0 });
   });
 });
