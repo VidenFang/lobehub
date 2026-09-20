@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { getTestDB } from '../../core/getTestDB';
@@ -33,6 +33,97 @@ describe('TopicModel', () => {
 
   afterEach(async () => {
     await serverDB.delete(users);
+  });
+
+  describe('rate-limit cancellation', () => {
+    const run = {
+      createdAt: '2026-09-19T00:00:00.000Z',
+      failedAssistantMessageId: 'failed-message',
+      kind: 'resume_after_rate_limit' as const,
+      source: 'heterogeneous_agent' as const,
+      runAt: '2026-09-19T01:00:00.000Z',
+      updatedAt: '2026-09-19T00:00:00.000Z',
+      userMessageId: 'user-message',
+    };
+    const claim = { claimedAt: run.createdAt, expiresAt: run.runAt, id: 'dispatcher' };
+
+    it('cancels status and payload together and prevents a later dispatcher claim', async () => {
+      const topic = await topicModel.create({ title: 'source' });
+      await topicModel.armScheduledRun(topic.id, run);
+      const result = await topicModel.cancelRateLimitContinuation(topic.id);
+      expect(result.status).toBe('cancelled');
+      const [row] = await serverDB.select().from(topics).where(eq(topics.id, topic.id));
+      expect(row.status).toBe('failed');
+      expect(row.metadata?.scheduledRun).toBeNull();
+      expect(await TopicModel.claimScheduledTopic(serverDB, topic.id, claim)).toBe(false);
+    });
+
+    it('refuses cancellation after the dispatcher claims, even if its lease expired', async () => {
+      const topic = await topicModel.create({ title: 'source' });
+      await topicModel.armScheduledRun(topic.id, run);
+      await TopicModel.claimScheduledTopic(serverDB, topic.id, claim, new Date(run.createdAt));
+      expect(await topicModel.cancelRateLimitContinuation(topic.id)).toEqual({ status: 'busy' });
+      const [row] = await serverDB.select().from(topics).where(eq(topics.id, topic.id));
+      expect(row.status).toBe('scheduled');
+      expect(row.metadata?.scheduledRun?.claim?.id).toBe('dispatcher');
+    });
+
+    it('rolls back both fields when the database rejects cancellation', async () => {
+      const topic = await topicModel.create({ title: 'source' }, 'cancel-rejected');
+      await topicModel.armScheduledRun(topic.id, run);
+      await serverDB.execute(
+        sql`ALTER TABLE topics ADD CONSTRAINT test_cancel_failure CHECK (id != 'cancel-rejected' OR status != 'failed')`,
+      );
+      try {
+        await expect(topicModel.cancelRateLimitContinuation(topic.id)).rejects.toThrow();
+        const [row] = await serverDB.select().from(topics).where(eq(topics.id, topic.id));
+        expect(row.status).toBe('scheduled');
+        expect(row.metadata?.scheduledRun).toEqual(run);
+      } finally {
+        await serverDB.execute(sql`ALTER TABLE topics DROP CONSTRAINT test_cancel_failure`);
+      }
+    });
+
+    it('allows only one of a concurrent cancellation and dispatcher claim', async () => {
+      const topic = await topicModel.create({ title: 'source' });
+      await topicModel.armScheduledRun(topic.id, run);
+      const [cancelled, claimed] = await Promise.all([
+        topicModel.cancelRateLimitContinuation(topic.id),
+        TopicModel.claimScheduledTopic(serverDB, topic.id, claim, new Date(run.createdAt)),
+      ]);
+      expect(Number(cancelled.status === 'cancelled') + Number(claimed)).toBe(1);
+    });
+
+    it('also cancels the legacy rate-limit payload the dispatcher can run', async () => {
+      const topic = await topicModel.create({ title: 'legacy' });
+      const { kind: _kind, runAt: _runAt, ...legacy } = run;
+      await serverDB
+        .update(topics)
+        .set({
+          status: 'scheduled',
+          metadata: sql`${JSON.stringify({ scheduledRun: { ...legacy, reason: 'rate_limit' } })}::jsonb`,
+        })
+        .where(eq(topics.id, topic.id));
+      expect((await topicModel.cancelRateLimitContinuation(topic.id)).status).toBe('cancelled');
+    });
+
+    it('does not cancel another user or a delayed-start schedule', async () => {
+      const topic = await topicModel.create({ title: 'source' });
+      await topicModel.armScheduledRun(topic.id, run);
+      expect(
+        await new TopicModel(serverDB, otherUserId).cancelRateLimitContinuation(topic.id),
+      ).toEqual({ status: 'unchanged' });
+      await topicModel.armScheduledRun(topic.id, {
+        createdAt: run.createdAt,
+        kind: 'delayed_start',
+        runAt: run.runAt,
+        updatedAt: run.updatedAt,
+        userMessageId: run.userMessageId,
+      });
+      expect(await topicModel.cancelRateLimitContinuation(topic.id)).toEqual({
+        status: 'unchanged',
+      });
+    });
   });
 
   describe('create', () => {
@@ -664,8 +755,43 @@ describe('TopicModel', () => {
       const byId = Object.fromEntries(result.map((t) => [t.id, t]));
 
       expect(byId['t-run'].runStartedAt).toEqual(new Date('2026-01-02T00:00:00Z'));
-      // A run that never wrote an operation row (e.g. client-mode) stays null.
+      // A run with neither an operation row nor a topic stamp stays null.
       expect(byId['t-no-op'].runStartedAt).toBeNull();
+    });
+
+    // Regression: client-executed runs (desktop CC / in-browser runtime) create
+    // no operation row, so the topic's own stamp is the only start time there is.
+    it('falls back to the topic stamp when the run left no operation row', async () => {
+      await serverDB.insert(topics).values([
+        {
+          id: 't-local',
+          metadata: { runStartedAt: '2026-01-05T00:00:00Z' },
+          status: 'running',
+          title: 'local',
+          userId,
+        },
+        {
+          id: 't-both',
+          metadata: { runStartedAt: '2026-01-06T00:00:00Z' },
+          status: 'running',
+          title: 'both',
+          userId,
+        },
+      ]);
+      await serverDB.insert(agentOperations).values({
+        id: 'op-both',
+        startedAt: new Date('2026-01-07T00:00:00Z'),
+        status: 'running',
+        topicId: 't-both',
+        userId,
+      });
+
+      const result = await topicModel.queryTopics({ statuses: ['running'] });
+      const byId = Object.fromEntries(result.map((t) => [t.id, t]));
+
+      expect(byId['t-local'].runStartedAt).toEqual(new Date('2026-01-05T00:00:00Z'));
+      // Server's own record of the run beats the client-reported stamp.
+      expect(byId['t-both'].runStartedAt).toEqual(new Date('2026-01-07T00:00:00Z'));
     });
 
     it('never resurrects a timer for a non-running topic with a stale running op', async () => {
@@ -858,6 +984,41 @@ describe('TopicModel', () => {
 
       const [cleared] = await topicModel.update(topic.id, { status: 'active' });
       expect(cleared.status).toBe('active');
+    });
+
+    // Regression: a desktop CC / in-browser run persists nothing but this status
+    // write, so without the stamp the home inbox had no start time for it and
+    // rendered no elapsed clock at all.
+    it('stamps when a client-executed run claimed the topic', async () => {
+      const topic = await topicModel.create({ metadata: { workingDirectory: '/w' }, title: 'run' });
+
+      const [running] = await topicModel.update(topic.id, { status: 'running' });
+
+      expect(running.metadata?.workingDirectory).toBe('/w');
+      expect(new Date(running.metadata!.runStartedAt!).getTime()).toBeGreaterThan(
+        Date.now() - 60_000,
+      );
+    });
+
+    it('keeps the original start when a run resumes from an approval', async () => {
+      const topic = await topicModel.create({ title: 'approval' });
+      const [started] = await topicModel.update(topic.id, { status: 'running' });
+      await topicModel.update(topic.id, { status: 'waitingForHuman' });
+
+      const [resumed] = await topicModel.update(topic.id, { status: 'running' });
+
+      expect(started.metadata?.runStartedAt).toBeDefined();
+      expect(resumed.metadata?.runStartedAt).toBe(started.metadata?.runStartedAt);
+    });
+
+    it('restamps when a new run starts on a settled topic', async () => {
+      const topic = await topicModel.create({ title: 'second turn' });
+      const [first] = await topicModel.update(topic.id, { status: 'running' });
+      await topicModel.update(topic.id, { status: 'unread' });
+
+      const [second] = await topicModel.update(topic.id, { status: 'running' });
+
+      expect(second.metadata?.runStartedAt).not.toBe(first.metadata?.runStartedAt);
     });
 
     it('does not update a topic owned by another user', async () => {

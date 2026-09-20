@@ -20,6 +20,7 @@ import type {
   EvalToolForwardingConfig,
   ExecutionPlan,
   ExpertiseContextSnapshot,
+  FrozenModelFacts,
   LobeAgentChatConfig,
   LobeAgentConfig,
   SecurityBlacklistConfig,
@@ -159,6 +160,8 @@ export interface AgentRunPlan {
 export interface AgentRunHostEnvelope {
   /** Serialized lifecycle hook configs (webhook mode), so a queue worker can rebuild the dispatcher. */
   hooks?: SerializedAgentHook[];
+  /** Opt into runtime state snapshots on step_complete events. Defaults to false. */
+  includeFinalState?: boolean;
   /** Queue retry policy for step scheduling. */
   queue?: { retries?: number; retryDelay?: string };
 }
@@ -348,6 +351,15 @@ export interface AgentState {
       video?: boolean;
       vision?: boolean;
     };
+    /**
+     * Every model fact the host read once when the operation was created (cards,
+     * the user's model row, the reasoning config that won the topic pin). Every
+     * LLM attempt of the run resolves its parameters from this snapshot, so an
+     * edit the user makes mid-run lands on the next turn instead of changing the
+     * payload between two steps. Absent on operations created before it existed,
+     * and for an attempt on another model — those resolve live.
+     */
+    modelFacts?: FrozenModelFacts;
     model: string;
     provider: string;
     /**

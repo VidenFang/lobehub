@@ -1,3 +1,5 @@
+import { normalizeHeterogeneousMessageError } from '@lobechat/heterogeneous-agents/errors';
+import { normalizeChatMessageError } from '@lobechat/model-runtime/errors';
 import {
   type ChatMessageError,
   type ChatMessagePluginError,
@@ -175,6 +177,15 @@ export class MessageService {
     return data as unknown as UIChatMessage[];
   };
 
+  /**
+   * Stored tool payload for a message whose projected copy dropped it
+   * (`UIChatMessage.payloadOmitted`). Called by detail surfaces on open, never
+   * as part of loading a conversation.
+   */
+  getToolResultPayload = async (messageId: string) => {
+    return lambdaClient.message.getToolResultPayload.query({ messageId });
+  };
+
   diagnoseTopic = async (params: { agentId?: string | null; topicId: string }) => {
     return lambdaClient.message.diagnoseTopic.query(params);
   };
@@ -213,9 +224,7 @@ export class MessageService {
   };
 
   updateMessageError = async (id: string, value: ChatMessageError, ctx?: MessageQueryContext) => {
-    const error = value.type
-      ? value
-      : { body: value, message: value.message, type: 'ApplicationRuntimeError' };
+    const error = normalizeHeterogeneousMessageError(normalizeChatMessageError(value));
 
     return lambdaClient.message.update.mutate({
       ...ctx,
